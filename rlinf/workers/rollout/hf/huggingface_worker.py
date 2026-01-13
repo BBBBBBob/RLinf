@@ -25,8 +25,7 @@ from rlinf.models import get_model, get_vla_model_config_and_processor
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.placement import HybridComponentPlacement
-
-
+from rlinf.data.io_struct import ActionOutput
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -114,7 +113,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.GR00T,
         ]:
             kwargs = {"mode": mode}
-
+        
         with torch.no_grad():
             actions, result = self.hf_model.predict_action_batch(
                 env_obs=env_obs,
@@ -138,7 +137,7 @@ class MultiStepRolloutWorker(Worker):
         # First step: no rewards yet, only dones
         if env_output["rewards"] is None:
             return env_output["dones"].bool().cpu().contiguous(), None
-
+    
         dones = env_output["dones"].bool().cpu().contiguous()
         rewards = env_output["rewards"].cpu().contiguous()
 
@@ -193,10 +192,11 @@ class MultiStepRolloutWorker(Worker):
         ):
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.num_pipeline_stages):
-                    env_output = self.recv_env_output()
+                    env_output = self.recv_env_output()   ### it is a dict
 
                     dones, rewards = self.get_dones_and_rewards(env_output)
                     actions, result = self.predict(env_output["obs"])
+
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
                         prev_values=result["prev_values"],
@@ -288,3 +288,140 @@ class MultiStepRolloutWorker(Worker):
     def set_global_step(self, global_step):
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
+
+class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        self._obs_rollout_queue_name = cfg.env.channel.queue_name_rollout
+        self._reward_queue_name = cfg.reward.channel.queue_name
+
+    def predict(self, env_obs, mode="train"):
+        kwargs = (
+            self._train_sampling_params
+            if mode == "train"
+            else self._eval_sampling_params
+        )
+
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.OPENPI,
+            SupportedModel.IRLOPENPI,
+            SupportedModel.MLP_POLICY,
+            SupportedModel.GR00T,
+        ]:
+            kwargs = {"mode": mode}
+        
+        with torch.no_grad():
+            actions, result = self.hf_model.predict_action_batch(
+                env_obs=env_obs,
+                **kwargs,
+            )
+
+        return actions, result
+    
+    # def preprocess_chunk_observations(self, env_output: dict[str, torch.Tensor]):
+    #     chunk_obs = env_output.get("chunk_observations")
+    #     if chunk_obs is None:
+    #         return env_output
+
+    #     obs_processor = getattr(self.hf_model, "obs_processor", None)
+    #     input_transform = getattr(self.hf_model, "input_transform", None)
+    #     precision_processor = getattr(self.hf_model, "precision_processor", None)
+    #     if obs_processor is None or input_transform is None or precision_processor is None:
+    #         return env_output
+
+    #     processed_obs = obs_processor(chunk_obs)
+    #     processed_obs = input_transform(processed_obs)
+    #     processed_obs = precision_processor(processed_obs)
+    #     env_output["chunk_observations"] = processed_obs
+
+    #     return env_output
+
+    def generate(self):
+        if self.enable_offload:
+            self.reload_model()
+
+        self.buffer_list = [
+            EmbodiedRolloutResult(rollout_epoch=self.cfg.algorithm.rollout_epoch)
+            for _ in range(self.num_pipeline_stages)
+        ]
+
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+    
+        for _ in tqdm(
+            range(self.cfg.algorithm.rollout_epoch),
+            desc="Generating Rollout Epochs",
+            disable=(self._rank != 0),
+        ):
+            for i in range(n_chunk_steps):
+                for stage_id in range(self.num_pipeline_stages):
+                    env_output = self.recv_env_output()
+                    actions, result = self.predict(env_output["obs"])
+                    reward_output = self.recv_reward()
+            
+                    normalized_actions = result["normalized_actions"]
+                    result["forward_inputs"].update(
+                        {"normalized_actions": normalized_actions}
+                    )
+                    
+                    if self.cfg.reward.use_next_image:
+                        if i > 0:
+                            result["forward_inputs"].update(
+                            {"observation/next_image": result["forward_inputs"]["observation/image"].clone()}
+                        )
+                    chunk_step_result = ChunkStepResult(
+                        prev_logprobs=result["prev_logprobs"],
+                        prev_values=result["prev_values"],
+                        dones=reward_output["dones"],
+                        rewards=reward_output["rewards"],  # the first step is reset step, reward is none, which will not be appended to the buffer
+                        forward_inputs=result["forward_inputs"],
+                    )
+                   
+                    self.buffer_list[stage_id].append_result(chunk_step_result)
+                    action_output = ActionOutput(actions=actions, normalized_actions=normalized_actions)
+                    self.send_chunk_actions(action_output.to_dict())
+
+
+            ### receive reward add last image
+            for stage_id in range(self.num_pipeline_stages):
+                # Get dones and rewards from reward worker (final step of epoch)
+                reward_output = self.recv_reward()
+                self.buffer_list[stage_id].dones.append(reward_output['dones'])
+                self.buffer_list[stage_id].rewards.append(reward_output['rewards'])
+
+                env_output = self.recv_env_output()
+                with self.worker_timer():
+                    actions, result = self.predict(env_output["obs"])
+                
+                if self.cfg.reward.use_next_image:
+                    self.buffer_list[stage_id].forward_inputs.append(
+                            {"observation/next_image": result["forward_inputs"]["observation/image"].clone()}
+                        )
+                # For the final step, we only need prev_values for bootstrapping
+                # This is a special case that doesn't create a full ChunkStepResult
+                if "prev_values" in result:
+                    self.buffer_list[stage_id].prev_values.append(
+                        result["prev_values"].cpu().contiguous()
+                    )
+                
+
+        for i in range(self.num_pipeline_stages):
+            self.send_rollout_batch(i)
+
+        if self.enable_offload:
+            self.offload_model()
+
+    def recv_env_output(self):
+        env_output = self.channel.get(
+            key=f"{self._obs_rollout_queue_name}_{self._rank}",
+        )
+        return env_output
+    
+    def recv_reward(self):
+        return self.channel.get(
+            key=f"{self._reward_queue_name}_{self._rank}",
+        )
+    

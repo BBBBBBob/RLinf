@@ -18,6 +18,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import torch
+import numpy as np
 from omegaconf import DictConfig
 
 if TYPE_CHECKING:
@@ -1089,6 +1090,145 @@ class EnvOutput:
         return env_output_dict
 
 
+# @dataclass(kw_only=True)
+# class IRLEnvOutput(EnvOutput):
+#     chunk_observations: Optional[dict[str, Any]] = None
+#     chunk_normalized_actions: Optional[torch.Tensor] = None
+#     steps: Optional[torch.Tensor] = None
+
+#     def __post_init__(self):
+#         super().__post_init__()
+#         self.chunk_observations = (
+#             put_tensor_cpu(self.chunk_observations)
+#             if self.chunk_observations is not None
+#             else None
+#         )
+#         self.chunk_normalized_actions = (
+#             self.chunk_normalized_actions.cpu().contiguous()
+#             if self.chunk_normalized_actions is not None
+#             else None
+#         )
+
+#         self.steps = (
+#             self.steps.cpu().contiguous()
+#             if self.steps is not None
+#             else None
+#         )
+
+#     def to_dict(self):
+#         env_output_dict = super().to_dict()
+#         env_output_dict["chunk_observations"] = (
+#             self.prepare_observations(self.chunk_observations)
+#             if self.chunk_observations is not None
+#             else None
+#         )
+#         env_output_dict["chunk_normalized_actions"] = self.chunk_normalized_actions
+#         env_output_dict["steps"] = self.steps
+#         return env_output_dict
+
+@dataclass(kw_only=True)
+class RolloutEnvOutput:
+    obs: dict[str, Any]
+    dones: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.obs = put_tensor_cpu(self.obs)
+        self.dones = (
+            self.dones.cpu().contiguous()
+            if self.dones is not None
+            else None
+        )
+
+    def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
+        image_tensor = obs["images"] if "images" in obs else None
+        wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+        states = obs["states"] if "states" in obs else None
+        task_descriptions = (
+            list(obs["task_descriptions"]) if "task_descriptions" in obs else None
+        )
+
+        return {
+            "images": image_tensor,
+            "wrist_images": wrist_image_tensor,
+            "states": states,
+            "task_descriptions": task_descriptions,
+        }
+
+    def to_dict(self):
+        rollout_env_output_dict = {}
+        rollout_env_output_dict["obs"] = self.prepare_observations(self.obs)
+        rollout_env_output_dict["dones"] = self.dones
+
+        return rollout_env_output_dict
+
+@dataclass(kw_only=True)
+class RewardEnvOutput(EnvOutput):
+    normalized_actions: torch.Tensor
+    next_obs: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.normalized_actions = self.normalized_actions.cpu().contiguous()
+        self.next_obs = self.next_obs.cpu().contiguous() if self.next_obs is not None else None
+
+    def to_dict(self):
+        reward_env_output_dict = super().to_dict()
+        reward_env_output_dict["normalized_actions"] = self.normalized_actions
+        reward_env_output_dict["next_obs"] = self.next_obs
+
+        return reward_env_output_dict
+
+
+@dataclass(kw_only=True)
+class RewardOutput:
+    rewards: Optional[torch.Tensor] = None
+    dones: Optional[torch.Tensor] = None
+    # last_obs: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.rewards = (
+            self.rewards.cpu().contiguous()
+            if self.rewards is not None
+            else None
+        )
+
+        self.dones = (
+            self.dones.cpu().contiguous()
+            if self.dones is not None
+            else None
+        )
+
+        # self.last_obs = (
+        #     self.last_obs.cpu().contiguous()
+        #     if self.last_obs is not None
+        #     else None
+        # )
+
+    def to_dict(self):
+        reward_output_dict = {}
+        reward_output_dict["rewards"] = self.rewards
+        reward_output_dict["dones"] = self.dones
+        # reward_output_dict["last_obs"] = self.last_obs
+
+        return reward_output_dict
+
+@dataclass(kw_only=True)
+class ActionOutput:
+    actions: np.ndarray
+    normalized_actions: torch.Tensor
+
+    def __post_init__(self):
+        self.actions = np.ascontiguousarray(self.actions)
+        self.normalized_actions = self.normalized_actions.cpu().contiguous()
+
+    def to_dict(self):
+        action_output_dict = {}
+        action_output_dict["actions"] = self.actions
+        action_output_dict["normalized_actions"] = self.normalized_actions
+
+        return action_output_dict
+    
+
 @dataclass(kw_only=True)
 class ChunkStepResult:
     # required
@@ -1203,3 +1343,4 @@ class EmbodiedRolloutResult:
             rollout_result_list.append(split_dict)
 
         return rollout_result_list
+1290

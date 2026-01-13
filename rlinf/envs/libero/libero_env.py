@@ -406,7 +406,6 @@ class LiberoEnv(gym.Env):
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
-
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
@@ -498,3 +497,78 @@ class LiberoEnv(gym.Env):
         )
         self.video_cnt += 1
         self.render_images = []
+
+
+class IRLLiberoEnv(LiberoEnv):
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
+        super().__init__(cfg, num_envs, seed_offset, total_num_processes)
+    
+    def chunk_step(self, chunk_actions, last_extracted_obs):
+         # chunk_actions: [num_envs, chunk_step, action_dim]
+        chunk_size = chunk_actions.shape[1]
+        chunk_observations = {}
+        for key, value in last_extracted_obs.items():
+            if key != "task_descriptions":
+                chunk_observations[key] = torch.empty(
+                    (value.shape[0], chunk_size, *value.shape[1:]),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+                chunk_observations[key][:, 0] = value
+        chunk_observations["task_descriptions"] = list(
+            last_extracted_obs["task_descriptions"]
+        )
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for i in range(chunk_size):
+            actions = chunk_actions[:, i]
+            ### TODO check reward in the step function  
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                actions, auto_reset=False
+            )
+            if i < chunk_size - 1:
+                for key, value in extracted_obs.items():
+                    if key != "task_descriptions":
+                        chunk_observations[key][:, i + 1] = value
+                chunk_observations["task_descriptions"].append(last_extracted_obs["task_descriptions"])
+                
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
+        raw_chunk_terminations = torch.stack(
+            raw_chunk_terminations, dim=1
+        )  # [num_envs, chunk_steps]
+        raw_chunk_truncations = torch.stack(
+            raw_chunk_truncations, dim=1
+        )  # [num_envs, chunk_steps]
+
+        past_terminations = raw_chunk_terminations.any(dim=1)
+        past_truncations = raw_chunk_truncations.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
+
+        if past_dones.any() and self.auto_reset:
+            extracted_obs, infos = self._handle_auto_reset(
+                past_dones.cpu().numpy(), extracted_obs, infos
+            )
+
+        if self.auto_reset or self.ignore_terminations:
+            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            chunk_terminations[:, -1] = past_terminations
+
+            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+            chunk_truncations[:, -1] = past_truncations
+        else:
+            chunk_terminations = raw_chunk_terminations.clone()
+            chunk_truncations = raw_chunk_truncations.clone()
+        return (
+            extracted_obs,
+            chunk_observations,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos,
+        )

@@ -34,9 +34,9 @@ class CollectiveGroupInfo:
         self.workers = workers
         self.master_addr = master_addr
         self.master_port: Optional[int] = None
-
+       
         assert len(workers) == len(set(workers)), (
-            f"Workers in collective group {group_name} must be unique. Found duplicates."
+            f"Workers in collective group {group_name} must be unique. Found duplicates. workers are {workers}. Group name is {group_name}"
         )
 
         self.world_size = len(workers)

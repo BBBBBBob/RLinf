@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.data.io_struct import EnvOutput
+from rlinf.data.io_struct import EnvOutput, RolloutEnvOutput, RewardEnvOutput
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.env_manager import EnvManager
@@ -142,11 +142,11 @@ class EnvWorker(Worker):
             policy=self.cfg.actor.model.get("policy_setup", None),
         )
         env_info = {}
-
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
             self.simulator_list[stage_id].chunk_step(chunk_actions)
         )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
+
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
                 if chunk_truncations[:, -1].any():
@@ -397,3 +397,185 @@ class EnvWorker(Worker):
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
         return eval_metrics
+
+
+class IRLEnvWorker(EnvWorker):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        self._obs_rollout_queue_name = cfg.env.channel.queue_name_rollout
+        self._obs_reward_queue_name = cfg.env.channel.queue_name_reward
+
+    ### typing might not be correct
+    def env_interact_step(
+        self, chunk_actions: np.ndarray, chunk_normalized_actions: torch.Tensor, last_extracted_obs: dict[str, Any], stage_id: int
+    ) -> tuple[EnvOutput, dict[str, Any]]:
+        """
+        This function is used to interact with the environment.
+        Rewrite for IRL
+        """
+        chunk_actions = prepare_actions(
+            raw_chunk_actions=chunk_actions,
+            simulator_type=self.cfg.env.train.simulator_type,
+            model_type=self.cfg.actor.model.model_type,
+            num_action_chunks=self.cfg.actor.model.num_action_chunks,
+            action_dim=self.cfg.actor.model.action_dim,
+            policy=self.cfg.actor.model.get("policy_setup", None),
+        )
+        env_info = {}
+        ### Only for LIBERO-IRL, observation chunk is not correct
+        ### IRL takes current observation and action pair
+        ### This is for the each step and action pairs
+        # extracted_obs, chunk_observations, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+        #     self.simulator_list[stage_id].chunk_step(chunk_actions, last_extracted_obs)
+        # )
+        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+            self.simulator_list[stage_id].chunk_step(chunk_actions)
+        )
+        chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
+        if not self.cfg.env.train.auto_reset:
+            if self.cfg.env.train.ignore_terminations:
+                if chunk_truncations[:, -1].any():
+                    assert chunk_truncations[:, -1].all()
+                    if "episode" in infos:
+                        for key in infos["episode"]:
+                            env_info[key] = infos["episode"][key].cpu()
+            else:
+                if "episode" in infos:
+                    for key in infos["episode"]:
+                        env_info[key] = infos["episode"][key].cpu()
+        elif chunk_dones.any():
+            if "final_info" in infos:
+                final_info = infos["final_info"]
+                for key in final_info["episode"]:
+                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+
+        # steps = (torch.arange(self.cfg.actor.model.num_action_chunks, dtype=torch.int8)
+        #         .view(1, self.cfg.actor.model.num_action_chunks)
+        #         .expand(chunk_actions.shape[0], -1))
+        
+        rollout_env_output = RolloutEnvOutput(
+            obs=extracted_obs,
+            dones=chunk_dones
+        )
+
+        reward_env_output = RewardEnvOutput(
+            obs=last_extracted_obs,
+            final_obs=infos["final_observation"]
+            if "final_observation" in infos
+            else None,
+            rewards=chunk_rewards,
+            dones=chunk_dones,
+            normalized_actions=chunk_normalized_actions,
+            next_obs=extracted_obs['images'] if self.cfg.reward.use_next_image else None,
+        )
+
+        return rollout_env_output, reward_env_output, env_info
+
+    def interact(self):
+        for simulator in self.simulator_list:
+            simulator.start_simulator()
+
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+
+        env_metrics = defaultdict(list)
+        for epoch in range(self.cfg.algorithm.rollout_epoch):
+            env_output_list = []
+            if not self.cfg.env.train.auto_reset:
+                for stage_id in range(self.stage_num):
+                    self.simulator_list[stage_id].is_start = True
+                    extracted_obs, infos = self.simulator_list[stage_id].reset()
+                    dones = (
+                        torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
+                        .unsqueeze(1)
+                        .repeat(1, self.cfg.actor.model.num_action_chunks)
+                    )
+                    env_output = EnvOutput(
+                        obs=extracted_obs,
+                        dones=dones,
+                        final_obs=infos["final_observation"]
+                        if "final_observation" in infos
+                        else None,
+                    )
+                    env_output_list.append(env_output)
+            else:
+                self.num_done_envs = 0
+                self.num_succ_envs = 0
+                for stage_id in range(self.stage_num):
+                    env_output = EnvOutput(
+                        obs=self.last_obs_list[stage_id],
+                        rewards=None,
+                        dones=self.last_dones_list[stage_id],
+                    )
+                    env_output_list.append(env_output)
+
+            for stage_id in range(self.stage_num):
+                env_output: EnvOutput = env_output_list[stage_id]
+                self.send_env_batch(env_output.to_dict(), env_output.to_dict())
+
+            for _ in range(n_chunk_steps):
+                for stage_id in range(self.stage_num):
+                    last_extracted_obs = env_output_list[stage_id].obs
+                    raw_chunk_actions, chunk_normalized_actions = self.recv_chunk_actions()
+                    rollout_env_output, reward_env_output, env_info = self.env_interact_step(
+                        chunk_actions=raw_chunk_actions,
+                        chunk_normalized_actions=chunk_normalized_actions,
+                        last_extracted_obs=last_extracted_obs, 
+                        stage_id=stage_id
+                    )
+                    self.send_env_batch(rollout_env_output.to_dict(), reward_env_output.to_dict())
+                    env_output_list[stage_id] = rollout_env_output
+                    for key, value in env_info.items():
+                        if (
+                            not self.cfg.env.train.auto_reset
+                            and not self.cfg.env.train.ignore_terminations
+                        ):
+                            if key in env_metrics and len(env_metrics[key]) > epoch:
+                                env_metrics[key][epoch] = value
+                            else:
+                                env_metrics[key].append(value)
+                        else:
+                            env_metrics[key].append(value)
+
+            self.last_obs_list = [env_output.obs for env_output in env_output_list]
+            self.last_dones_list = [env_output.dones for env_output in env_output_list]
+            self.finish_rollout()
+
+        for simulator in self.simulator_list:
+            simulator.stop_simulator()
+
+        for key, value in env_metrics.items():
+            env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        return env_metrics
+    
+    def recv_chunk_actions(self):
+        chunk_action = []
+        chunk_normalized_action = []
+        for gather_id in range(self.gather_num):
+            action_output = self.channel.get(
+                    key=f"{self._action_queue_name}_{gather_id + self._rank * self.gather_num}"
+                )
+            chunk_action.append(action_output['actions'])
+            chunk_normalized_action.append(action_output['normalized_actions'])
+
+        chunk_action = np.concatenate(chunk_action, axis=0)
+        chunk_normalized_action = torch.concatenate(chunk_normalized_action, dim=0)
+
+        return chunk_action, chunk_normalized_action
+
+    def send_env_batch(self, rollout_env_batch, reward_env_batch, mode="train"):
+        # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
+        for gather_id in range(self.gather_num):
+            rollout_env_batch_i = self.split_env_batch(rollout_env_batch, gather_id, mode)
+            reward_env_batch_i = self.split_env_batch(reward_env_batch, gather_id, mode)
+            self.channel.put(
+                item=rollout_env_batch_i,
+                key=f"{self._obs_rollout_queue_name}_{gather_id + self._rank * self.gather_num}",
+            )
+            self.channel.put(
+                item=reward_env_batch_i,
+                key=f"{self._obs_reward_queue_name}_{gather_id + self._rank * self.gather_num}",
+            )

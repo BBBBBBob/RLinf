@@ -15,7 +15,7 @@
 import os
 from abc import ABC, abstractmethod
 from logging import Logger
-from typing import ContextManager, Optional, Union
+from typing import ContextManager, Mapping, Optional, Union
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -155,8 +155,8 @@ class FSDPStrategyBase(ABC):
         cls,
         model_path: str,
         model: Union[FSDP, FSDPModule],
-        optimizer: Optimizer,
-        lr_scheduler: LRScheduler,
+        optimizer: Union[Optimizer, Mapping[str, Optimizer]],
+        lr_scheduler: Union[LRScheduler, Mapping[str, LRScheduler]],
         save_path: str,
     ) -> None:
         """
@@ -172,8 +172,8 @@ class FSDPStrategyBase(ABC):
             model_path (str): The original path to load model config and code, we
                 use it to copy model config and code to safetensors' save_path.
             model (Union[FSDP, FSDPModule]): The model to be saved.
-            optimizer (Optimizer): The optimizer to be saved.
-            lr_scheduler (LRScheduler): The learning rate scheduler to be saved.
+            optimizer (Optimizer or Mapping[str, Optimizer]): The optimizer(s) to be saved.
+            lr_scheduler (LRScheduler or Mapping[str, LRScheduler]): The learning rate scheduler(s) to be saved.
             save_path (str): The path to save the checkpoint.
         """
         torch.distributed.barrier()
@@ -211,8 +211,8 @@ class FSDPStrategyBase(ABC):
     def load_checkpoint(
         cls,
         model: Union[FSDP, FSDPModule],
-        optimizer: Optimizer,
-        lr_scheduler: LRScheduler,
+        optimizer: Union[Optimizer, Mapping[str, Optimizer]],
+        lr_scheduler: Union[LRScheduler, Mapping[str, LRScheduler]],
         load_path: str,
     ) -> None:
         """
@@ -226,8 +226,8 @@ class FSDPStrategyBase(ABC):
 
         Args:
             model (Union[FSDP, FSDPModule]): The model to load the checkpoint into.
-            optimizer (Optimizer): The optimizer to load the checkpoint into.
-            lr_scheduler (LRScheduler): The learning rate scheduler to load the checkpoint into.
+            optimizer (Optimizer or Mapping[str, Optimizer]): The optimizer(s) to load the checkpoint into.
+            lr_scheduler (LRScheduler or Mapping[str, LRScheduler]): The learning rate scheduler(s) to load the checkpoint into.
             load_path (str): The path to load the checkpoint from.
         """
         torch.distributed.barrier()

@@ -185,11 +185,29 @@ class Cluster:
 
         try:
             # First try to connect to an existing Ray cluster
+            # ray.init(
+            #     _temp_dir="/home/j84403411/ray_tmp",
+            #     address="auto",
+            #     logging_level=Cluster.LOGGING_LEVEL,
+            #     namespace=Cluster.NAMESPACE,
+            # )
+            # for k in [
+            #     "RAY_ADDRESS",
+            #     "RAY_HEAD_IP",
+            #     "RAY_CLIENT_MODE",
+            # ]:
+            #     os.environ.pop(k, None) 
+            
+            # os.system("ray stop --force >/dev/null 2>&1")
+            print("Trying to connect to existing ray cluster...", flush=True)
             ray.init(
-                address="auto",
+                # address="local",
+                include_dashboard=False,
+                # _temp_dir="/home/j84403411/ray_tmp",
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
             )
+           
         except ConnectionError:
             ray.init(
                 logging_level=Cluster.LOGGING_LEVEL,

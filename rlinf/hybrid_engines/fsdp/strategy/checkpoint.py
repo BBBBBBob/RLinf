@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
+from typing import Mapping, Union
 
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -32,8 +32,8 @@ class Checkpoint(Stateful):
     def __init__(
         self,
         model: Union[FSDP, FSDPModule],
-        optimizer: Optimizer,
-        lr_scheduler: LRScheduler,
+        optimizer: Union[Optimizer, Mapping[str, Optimizer]],
+        lr_scheduler: Union[LRScheduler, Mapping[str, LRScheduler]],
         opts: StateDictOptions,
         fsdp_version: FSDPVersion,
     ):
@@ -47,12 +47,14 @@ class Checkpoint(Stateful):
         model_sd, optim_sd = get_state_dict(
             model=self.model, optimizers=self.optimizer, options=self.opts
         )
-        out = {
-            "model": model_sd,
-            "optim": optim_sd,
-            "lr_scheduler": self.lr_scheduler.state_dict(),
-            "fsdp_version": self.fsdp_version.value,
-        }
+        out = {"model": model_sd, "optim": optim_sd, "fsdp_version": self.fsdp_version.value}
+        if isinstance(self.lr_scheduler, Mapping):
+            out["lr_scheduler"] = {
+                name: scheduler.state_dict()
+                for name, scheduler in self.lr_scheduler.items()
+            }
+        else:
+            out["lr_scheduler"] = self.lr_scheduler.state_dict()
         out["rng"] = get_rng_state()
         return out
 
@@ -63,14 +65,35 @@ class Checkpoint(Stateful):
             raise ValueError(
                 f"FSDP version mismatch: checkpoint version {ckpt_fsdp_version} != current version {self.fsdp_version}"
             )
+        optim_state = state["optim"]
+        if isinstance(self.optimizer, Mapping) and not isinstance(optim_state, dict):
+            if "main" in self.optimizer:
+                optim_state = {"main": optim_state}
+            else:
+                first_key = next(iter(self.optimizer))
+                optim_state = {first_key: optim_state}
         set_state_dict(
             model=self.model,
             optimizers=self.optimizer,
             model_state_dict=state["model"],
-            optim_state_dict=state["optim"],
+            optim_state_dict=optim_state,
             options=self.opts,
         )
-        if self.lr_scheduler is not None and "lr_scheduler" in state:
-            self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        if "lr_scheduler" in state:
+            if isinstance(self.lr_scheduler, Mapping):
+                sched_state = state["lr_scheduler"]
+                if isinstance(sched_state, dict):
+                    for name, scheduler in self.lr_scheduler.items():
+                        if name in sched_state:
+                            scheduler.load_state_dict(sched_state[name])
+                else:
+                    if "main" in self.lr_scheduler:
+                        self.lr_scheduler["main"].load_state_dict(sched_state)
+                    else:
+                        next(iter(self.lr_scheduler.values())).load_state_dict(
+                            sched_state
+                        )
+            else:
+                self.lr_scheduler.load_state_dict(state["lr_scheduler"])
         if "rng" in state:
             set_rng_state(state["rng"])

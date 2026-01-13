@@ -28,6 +28,7 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.modules.discriminator_head import DiscriminatorHead
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class OpenPi0Config(Pi0Config):
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
 
+
 class OpenPi0ForRLActionPrediction(PI0Pytorch):
     """
     Pi0 model for reinforcement learning action prediction.
@@ -98,7 +100,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
         )
-
         # rl model init
         if self.config.value_after_vlm:
             proj_width = 2048
@@ -207,6 +208,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         compute_values = kwargs.get("compute_values", False)
         chains = data["chains"]
         denoise_inds = data["denoise_inds"]
+        
         # input transform
         observation = self.input_transform(data)
         observation = _model.Observation.from_dict(observation)
@@ -317,6 +319,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
             "prev_values": outputs["prev_values"],
             "forward_inputs": forward_inputs,
         }
+       
         return actions, result
 
     @torch.no_grad()
@@ -331,6 +334,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         bsize = observation.state.shape[0]
         device = observation.state.device
         num_steps = self.config.num_steps
+
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
@@ -438,7 +442,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
-            "prev_values": values,
+            "prev_values": values,  ### batch x 1
             "denoise_inds": denoise_inds,
         }
 
@@ -482,6 +486,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1]
         # velocity prediction
+        ## suffix_out batch x 10 x 1024
         suffix_out = self.get_suffix_out(
             state,
             prefix_pad_masks,
@@ -490,6 +495,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
             t_input,
         )
         v_t = self.action_out_proj(suffix_out)  # [bs,n_action_steps,max_action_dim]
+        
         # value prediction
         if (
             self.config.add_value_head
@@ -679,13 +685,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
             entropy = self.gaussian_entropy(x_t_std)
             chains_log_probs.append(log_probs)
             chains_entropy.append(entropy)
-            if self.use_vlm_value:
-                chains_values.append(self.get_value_from_vlm(prefix_output))
-            else:
-                chains_values.append(value_t)
-        chains_log_probs = torch.stack(chains_log_probs, dim=1)
-        chains_values = torch.stack(chains_values, dim=1)
 
+            ### optimize the value computation if use_vlm_value is True
+            # if self.use_vlm_value:
+            #     chains_values.append(self.get_value_from_vlm(prefix_output))
+            if not self.use_vlm_value:
+                chains_values.append(value_t)
+
+        chains_log_probs = torch.stack(chains_log_probs, dim=1)
+        if self.use_vlm_value:
+            chains_values.append(self.get_value_from_vlm(prefix_output))
+        chains_values = torch.stack(chains_values, dim=1)
         # entropy is only available for flow-noise method
         if self.config.noise_method == "flow_noise":
             chains_entropy = torch.stack(chains_entropy, dim=1)
@@ -732,3 +742,242 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
             self.paligemma_with_expert.paligemma.eval()
             for params in self.paligemma_with_expert.paligemma.parameters():
                 params.requires_grad = False
+
+
+### TODO Check if new config is needed
+### rewrite forward and add reward model
+### reward should be updated at each step
+### suffix att mask is not a casual mask
+class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
+    """
+    Pi05 model for reinforcement learning and inverse reinforcement learning.
+    """
+
+    config: OpenPi0Config
+
+    def __init__(
+        self,
+        config: OpenPi0Config,
+    ):
+        super().__init__(config)
+        
+        self.discriminator_head = DiscriminatorHead(
+            input_dim=1024,
+            hidden_sizes=(512, 256, 128),
+            output_dim=1,
+            activation="relu",
+            bias_last=True,
+        )
+    
+    ### TODO normalized the demonstration action, normalize the action before input
+    def demo_action_transform(self, demo_action: dict):
+        ### make sure the input here is 32?
+        # split & transform
+        batch_size = demo_action['actions'].shape[0]
+        transformed_samples = []
+        for i in range(batch_size):
+            sample = jax.tree.map(lambda x: np.asarray(x[i].detach().cpu()) if torch.is_tensor(x) else x, demo_action)
+            sample = self._input_transform(sample)
+            transformed_samples.append(sample)
+        # recombine
+        demo_action = jax.tree.map(
+            lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
+            *transformed_samples,
+        )
+  
+        return demo_action
+    
+    def obs_processor(self, env_obs):
+        # base observation
+        processed_obs = {
+            "observation/image": env_obs["images"],
+            "prompt": env_obs["task_descriptions"],
+        }
+        # state observation
+        if "calvin" in self.config.config_name:
+            state = env_obs["states"]
+            processed_obs["observation/state_ee_pos"] = state[:, :3]
+            processed_obs["observation/state_ee_rot"] = state[:, 3:6]
+            processed_obs["observation/state_gripper"] = state[:, 6:7]
+        else:
+            processed_obs["observation/state"] = env_obs["states"]
+        # wrist image observation
+        if env_obs["wrist_images"] is not None:
+            processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
+        # last extracted image
+        if "next_image" in env_obs:
+            processed_obs["observation/next_image"] = env_obs["next_image"]
+        return processed_obs
+    
+    def get_prefix_pad_masks_and_kv(self, observation: _model.Observation):        
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        (_, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        return prefix_pad_masks, past_key_values
+
+    @torch.no_grad()
+    def predict_reward_batch(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        # env_obs = data['chunk_observations']
+        env_obs = data['obs']
+        if "next_obs" in data:
+            env_obs.update({"next_image": data["next_obs"]})
+        to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs, change the keys
+        processed_obs = self.input_transform(
+            to_process_obs
+        )  # policy input obs -> model input obs, normalizing the images
+        processed_obs = self.precision_processor(
+            processed_obs
+        )  # obs precision processor
+        observation = _model.Observation.from_dict(processed_obs)
+        prefix_pad_masks, past_key_values = self.get_prefix_pad_masks_and_kv(observation)
+
+        ## suffix_out batch x 10 x 1024
+        state = observation.state
+        device = state.device
+        x_t = data['normalized_actions'].to(device=device)
+        t_input = torch.zeros((x_t.shape[0],), device=device)
+        
+        suffix_out = self.get_suffix_out(
+            state,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            t_input,
+        ).detach()   
+        disc_out = self.discriminator_head(suffix_out[:, :self.config.action_chunk]).squeeze(-1)
+        rewards = torch.maximum(torch.zeros(disc_out.shape, device=device), disc_out) + torch.log1p(torch.exp(-torch.abs(disc_out)))
+
+        return rewards
+        # return rewards, to_process_obs["observation/next_image"].cpu().contiguous()
+    
+    def predict_action_batch(
+        self, env_obs, mode: Literal["train", "eval"] = "train", compute_values=True
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
+        processed_obs = self.input_transform(
+            to_process_obs
+        )  # policy input obs -> model input obs
+        processed_obs = self.precision_processor(
+            processed_obs
+        )  # obs precision processor
+        observation = _model.Observation.from_dict(processed_obs)
+        outputs = self.sample_actions(
+            observation, mode=mode, compute_values=compute_values
+        )
+        actions = self.output_transform(
+            {"actions": outputs["actions"], "state": observation.state}
+        )["actions"].numpy()
+
+        forward_inputs = {
+            "chains": outputs["chains"],
+            "denoise_inds": outputs["denoise_inds"],
+            "tokenized_prompt": processed_obs["tokenized_prompt"],
+            "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+        }
+        forward_inputs.update(to_process_obs)
+        forward_inputs.pop("prompt", None)
+        result = {
+            "prev_logprobs": outputs["prev_logprobs"],
+            "prev_values": outputs["prev_values"],
+            "forward_inputs": forward_inputs,
+            "normalized_actions": outputs["actions"].detach().cpu().contiguous()
+        }
+        return actions, result
+    
+    def forward(
+        self,
+        data: dict[str, torch.Tensor],
+        head_name: str = "actor_critic",
+        **kwargs,
+    ) -> dict[str, Any]:
+        # get kwargs
+        if head_name == "actor_critic":
+            compute_values = kwargs.get("compute_values", False)
+            chains = data["chains"]
+            denoise_inds = data["denoise_inds"]
+            
+            # input transform
+            observation = self.input_transform(data)
+            observation = _model.Observation.from_dict(observation)
+            images, img_masks, lang_tokens, lang_masks, state = (
+                self._preprocess_observation(observation, train=False)
+            )
+            # transfer to device
+            device = chains.device
+            images = [img.to(device) for img in images]
+            img_masks = [img_mask.to(device) for img_mask in img_masks]
+            state = state.to(device)
+            # get log prob
+            log_probs, value_t, entropy = self.get_log_prob_value(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                chains,
+                denoise_inds,
+                compute_values,
+            )
+            log_probs = log_probs[
+                :, :, : self.config.action_chunk, : self.config.action_env_dim
+            ]
+            entropy = entropy[
+                :, :, : self.config.action_chunk, : self.config.action_env_dim
+            ]
+            # post process
+            log_probs = log_probs.mean(dim=1)
+            entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[
+                :, None
+            ]  # [:,None] to align with loss-mask shape
+            value_t = value_t.mean(dim=-1, keepdim=False)
+            return {
+                "logprobs": log_probs,
+                "values": value_t,
+                "entropy": entropy,
+            }
+        elif head_name == "discriminator":
+            ## If the data comes from the policy
+            observation = self.input_transform(data)
+            observation = self.precision_processor(observation)
+            observation = _model.Observation.from_dict(observation)
+
+            state = observation.state
+            device = state.device
+            t_input = torch.zeros((state.shape[0],), device=device)
+            
+            with torch.no_grad():
+                prefix_pad_masks, past_key_values = self.get_prefix_pad_masks_and_kv(observation)
+                suffix_out = self.get_suffix_out(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    data["normalized_actions"],
+                    t_input,
+                )
+        
+            disc_out = self.discriminator_head(suffix_out[:, :self.config.action_chunk]).squeeze(-1)
+            
+            return disc_out
+        
+        else:
+            raise ValueError(f"Invalid head name: {head_name}")
+        

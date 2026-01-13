@@ -134,7 +134,7 @@ class FSDPModelManager:
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
         )
-
+        
         if use_gptq:
             from auto_gptq import AutoGPTQForCausalLM  # type: ignore[import-not-found]
 
@@ -255,6 +255,10 @@ class FSDPModelManager:
             self._cfg.fsdp_config.amp.use_grad_scaler
         )
 
+        if self._cfg.use_reward_model:
+            self.discriminator_optimizer = self.build_discriminator_optimizer(model=self.model)
+            self.discriminator_lr_scheduler = self.build_discriminator_scheduler(optimizer=self.discriminator_optimizer)
+
     def get_model_state_dict(self) -> dict:
         """
         Get full model state dict.
@@ -269,8 +273,19 @@ class FSDPModelManager:
         Params:
             load_path: the directory to load checkpoint.
         """
+        optimizers = self.optimizer
+        lr_schedulers = self.lr_scheduler
+        if self._cfg.use_reward_model:
+            optimizers = {
+                "main": self.optimizer,
+                "discriminator": self.discriminator_optimizer,
+            }
+            lr_schedulers = {
+                "main": self.lr_scheduler,
+                "discriminator": self.discriminator_lr_scheduler,
+            }
         self._strategy.load_checkpoint(
-            self.model, self.optimizer, self.lr_scheduler, load_path
+            self.model, optimizers, lr_schedulers, load_path
         )
 
     def save_checkpoint(self, save_path: str) -> None:
@@ -281,11 +296,22 @@ class FSDPModelManager:
         Params:
             save_path: the directory to save checkpoint.
         """
+        optimizers = self.optimizer
+        lr_schedulers = self.lr_scheduler
+        if self._cfg.use_reward_model:
+            optimizers = {
+                "main": self.optimizer,
+                "discriminator": self.discriminator_optimizer,
+            }
+            lr_schedulers = {
+                "main": self.lr_scheduler,
+                "discriminator": self.discriminator_lr_scheduler,
+            }
         self._strategy.save_checkpoint(
             self.model_path,
             self.model,
-            self.optimizer,
-            self.lr_scheduler,
+            optimizers,
+            lr_schedulers,
             save_path,
         )
 
@@ -484,3 +510,61 @@ class FSDPModelManager:
         return self._strategy.before_micro_batch(
             model=model, is_last_micro_batch=is_last_micro_batch
         )
+
+    def build_discriminator_optimizer(self, model: nn.Module) -> Optimizer:
+        betas = (
+            self._cfg.optim.get("discriminator_beta1", self._cfg.optim.disc_adam_beta1),
+            self._cfg.optim.get("discriminator_beta2", self._cfg.optim.disc_adam_beta2),
+        )
+        
+        lr = self._cfg.optim.get("discriminator_lr", self._cfg.optim.disc_lr)
+
+        disc_params = [
+            p for name, p in model.named_parameters() if "discriminator_head" in name
+        ]
+
+        optim = torch.optim.AdamW([{"params": disc_params, "lr": lr, "betas": betas}])
+        warmup_optimizer_state(optim)  # same pattern as build_optimizer
+        return optim
+
+    def build_discriminator_scheduler(self, optimizer: Optimizer) -> LRScheduler:
+        return self.build_lr_scheduler(optimizer)
+
+    def offload_discriminator_optimizer(self) -> None:
+        """
+        Offload optimizer states to CPU.
+        """
+        self._strategy.offload_optimizer(self.discriminator_optimizer)
+
+    def load_discriminator_optimizer(self, device_id: int) -> None:
+        """
+        Load optimizer states to the specified device.
+
+        Params:
+            device_id: the target device id to load optimizer states.
+        """
+        self._strategy.onload_optimizer(self.discriminator_optimizer, device_id)
+
+    def discriminator_optimizer_step(self) -> tuple[float, list[float]]:
+        """
+        Perform optimizer step using its optimizer, lr_scheduler and grad_scaler.
+
+        Returns:
+            A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
+        """
+        self.grad_scaler.unscale_(optimizer=self.discriminator_optimizer)
+        grad_norm = self._strategy.clip_grad_norm_(
+            model=self.model,
+        )
+
+        if not torch.isfinite(torch.as_tensor(grad_norm)):
+            self._logger.warning(
+                f"[FSDP] Non-finite grad norm {grad_norm} detected. Skipping optimizer step."
+            )
+        else:
+            self.grad_scaler.step(optimizer=self.discriminator_optimizer)
+
+        self.grad_scaler.update()
+        lr_list = [group["lr"] for group in self.discriminator_optimizer.param_groups]
+
+        return grad_norm, lr_list

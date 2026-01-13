@@ -213,7 +213,7 @@ clone_or_reuse_repo() {
 
 install_common_embodied_deps() {
     uv sync --extra embodied --active
-    bash $SCRIPT_DIR/embodied/sys_deps.sh
+    # bash $SCRIPT_DIR/embodied/sys_deps.sh
     {
         echo "export NVIDIA_DRIVER_CAPABILITIES=all"
         echo "export VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json"

@@ -59,7 +59,6 @@ from rlinf.utils.utils import (
 )
 from rlinf.workers.rollout.utils import RankMapper
 
-
 class FSDPActor(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig, placement: ModelParallelComponentPlacement):
         Worker.__init__(self)
@@ -595,21 +594,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         # shape [num_chunk, bsz, chunk_size], cat dim 1
-        for key in recv_list[0].keys():
+        for key in recv_list[0].keys():  ### dim 1 is the num of environment which is bsz
             self.rollout_batch[key] = torch.cat(
                 [recv_list[i][key] for i in range(split_num)], dim=1
             )
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
-
+    ### dict_keys(['prev_logprobs', 'prev_values', 'dones', 'rewards', 'chains', 'denoise_inds', 'tokenized_prompt', 
+    ### 'tokenized_prompt_mask', 'observation/image', 'observation/state', 'observation/wrist_image', 
+    ### 'loss_mask', 'loss_mask_sum', 'advantages', 'returns'])
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """
-        original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
+        original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...] 2 x 48(49), bsz is env_num? num_action_chunks is 5
         target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
         """
         rollout_epoch = self.cfg.algorithm.rollout_epoch
+
         for key, value in rollout_batch.items():
             new_value = value.reshape(
                 rollout_epoch, -1, *value.shape[1:]
@@ -730,7 +732,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
-
+        
         with torch.no_grad():
             for key, value in self.rollout_batch.items():
                 if key in ["dones", "prev_values"]:
@@ -811,7 +813,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
-
+                    
                     with self.amp_context:
                         output_dict = self.model(
                             data=data,
@@ -897,3 +899,400 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def set_global_step(self, global_step):
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+
+
+class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        ### TODO add dataloader for expert demonstrations
+        self._reward_group_name = cfg.reward.group_name
+        self._weight_dst_rank_in_reward = self._rank
+        if self._weight_dst_rank_in_reward >= self._component_placement.get_world_size(
+            "reward"
+        ):
+            self._weight_dst_rank_in_reward = None
+
+    def init_worker(self):
+        self.setup_model_and_optimizer()
+
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        
+        if self.cfg.reward.get("enable_offload", False):
+            self.offload_discriminator_optimizer()
+
+    def sync_model_to_rollout(self):
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_optimizer()
+            # self.offload_discriminator_optimizer()
+
+        if next(self.model.parameters()).is_cpu:
+            if self.cfg.actor.get("enable_offload", False):
+                self.load_param_and_grad(self.device)
+
+        state_dict = self.get_model_state_dict()
+        if self._weight_dst_rank_in_rollout is not None:
+            self.send(
+                state_dict, self._rollout_group_name, self._weight_dst_rank_in_rollout
+            )
+
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_param_and_grad()
+
+    def sync_model_to_reward(self):
+        if self.cfg.reward.get("enable_offload", False):
+            # self.offload_optimizer()
+            self.offload_discriminator_optimizer()
+            
+        if next(self.model.parameters()).is_cpu:
+            if self.cfg.reward.get("enable_offload", False):
+                self.load_param_and_grad(self.device)
+
+        state_dict = self.get_model_state_dict()
+        if self._weight_dst_rank_in_reward is not None:
+            self.send(
+                state_dict, self._reward_group_name, self._weight_dst_rank_in_reward
+            )
+
+        if self.cfg.reward.get("enable_offload", False):
+            self.offload_param_and_grad()
+
+    def run_training(self):
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+        
+        if self.cfg.reward.get("enable_offload", False):
+            self.load_discriminator_optimizer(self.device)
+
+        self.model.train()
+        rollout_size = (
+            self.rollout_batch["prev_logprobs"].shape[0]
+            * self.rollout_batch["prev_logprobs"].shape[1]
+        )
+        g = torch.Generator()
+        g.manual_seed(self.cfg.actor.seed + self._rank)
+        shuffle_id = torch.randperm(rollout_size, generator=g)
+    
+        with torch.no_grad():
+            for key, value in self.rollout_batch.items():
+                if key in ["dones", "prev_values"]:
+                    value = value[:-1]
+                if "env_info" in key:
+                    continue
+                if value is None:
+                    continue
+                value = value.reshape(rollout_size, *value.shape[2:])
+                self.rollout_batch[key] = value[shuffle_id]
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        ), "global_batch_size is not divisible by micro_batch_size * world_size"
+
+        ### filter out observation/next_image
+        ### TODO is this in-place operation?
+        actor_critic_batch = {}
+        discriminator_batch = {}
+        for key, value in self.rollout_batch.items():
+            if key != "observation/next_image":
+                actor_critic_batch[key] = value
+            if (
+                "observation" in key
+                or "tokenized_prompt" in key
+                or "normalized_actions" in key
+            ):
+                discriminator_batch[key] = value
+
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        self.disc_gradient_accumulation = (
+            self.cfg.reward.global_batch_size
+            // self.cfg.reward.micro_batch_size
+            // self._world_size
+        )
+        # Split to make minibatch iterator for updating the actor
+        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        rollout_size = self.rollout_batch["prev_logprobs"].size(0)  ## rollout_size is the total batch from the rollout
+        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        assert rollout_size % batch_size_per_rank == 0, (
+            f"{rollout_size} is not divisible by {batch_size_per_rank}"
+        )
+        metrics = {}
+        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+
+        for _ in range(update_epoch):
+            rollout_dataloader_iter = get_iterator_k_split(
+                actor_critic_batch,
+                rollout_size // batch_size_per_rank,
+            )
+            for train_global_batch in rollout_dataloader_iter:
+                # split batch into micro_batches
+                train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+                assert (
+                    train_global_batch_size
+                    == self.cfg.actor.global_batch_size
+                    // torch.distributed.get_world_size()
+                )
+                assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
+                    f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                )
+                train_micro_batch = get_iterator_k_split(
+                    train_global_batch,
+                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+                )
+
+                self.optimizer.zero_grad()
+                for idx, data in enumerate(train_micro_batch):
+                    for k, v in data.items():
+                        data[k] = v.to(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+                    backward_ctx = self.before_micro_batch(
+                        self.model,
+                        is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                    )
+                    advantages = data["advantages"]
+                    prev_logprobs = data["prev_logprobs"]
+                    returns = data.get("returns", None)
+                    prev_values = data.get("prev_values", None)
+                    loss_mask = data.get("loss_mask", None)
+                    loss_mask_sum = data.get("loss_mask_sum", None)
+
+                    if SupportedModel(self.cfg.actor.model.model_type) in [
+                        SupportedModel.OPENVLA,
+                        SupportedModel.OPENVLA_OFT,
+                    ]:
+                        data["temperature"] = (
+                            self.cfg.algorithm.sampling_params.temperature_train
+                        )
+                        data["top_k"] = self.cfg.algorithm.sampling_params.top_k
+
+                    compute_values = (
+                        True if self.cfg.algorithm.adv_type == "gae" else False
+                    )
+                    
+                    with self.amp_context:
+                        output_dict = self.model(
+                            data=data,
+                            head_name="actor_critic",
+                            compute_logprobs=True,
+                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                            compute_values=compute_values,
+                            use_cache=False,
+                        )
+
+                    if SupportedModel(self.cfg.actor.model.model_type) in [
+                        SupportedModel.GR00T
+                    ]:
+                        prev_logprobs = output_dict["prev_logprobs"]
+
+                    kwargs = {
+                        "loss_type": self.cfg.algorithm.loss_type,
+                        "logprob_type": self.cfg.algorithm.logprob_type,
+                        "reward_type": self.cfg.algorithm.reward_type,
+                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                        "logprobs": output_dict["logprobs"],
+                        "values": output_dict.get("values", None),
+                        "old_logprobs": prev_logprobs,
+                        "advantages": advantages,
+                        "returns": returns,
+                        "prev_values": prev_values,
+                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                        "value_clip": self.cfg.algorithm.get("value_clip", None),
+                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                        "loss_mask": loss_mask,
+                        "loss_mask_sum": loss_mask_sum,
+                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                        "task_type": self.cfg.runner.task_type,
+                        "critic_warmup": self.optimizer_steps
+                        < self.critic_warmup_steps,
+                    }
+                    loss, metrics_data = policy_loss(**kwargs)
+
+                    entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                    if (
+                        self.cfg.algorithm.entropy_bonus > 0
+                        and not kwargs["critic_warmup"]
+                    ):
+                        entropy = output_dict["entropy"]
+                        entropy = reshape_entropy(
+                            entropy,
+                            entropy_type=self.cfg.algorithm.entropy_type,
+                            action_dim=self.cfg.actor.model.get("action_dim", 7),
+                            batch_size=output_dict["logprobs"].shape[0],
+                        )
+                        entropy_loss = masked_mean(entropy, mask=loss_mask)
+                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+
+                    metrics_data["entropy_loss"] = entropy_loss.detach().item()
+
+                    loss /= self.gradient_accumulation
+                    with backward_ctx:
+                        self.grad_scaler.scale(loss).backward()
+
+                    metrics_data["loss"] = loss.detach().item()
+                    append_to_dict(metrics, metrics_data)
+
+                torch.cuda.empty_cache()
+
+                grad_norm, lr_list = self.optimizer_step()
+                data = {
+                    "actor/grad_norm": grad_norm,
+                    "actor/lr": lr_list[0],
+                }
+                if len(lr_list) > 1:
+                    data["critic/lr"] = lr_list[1]
+                append_to_dict(metrics, data)
+        # put LR scheduler step here
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        clear_memory()
+        # mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        # mean_metric_dict = all_reduce_dict(
+        #     mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        # )
+
+        # return mean_metric_dict
+
+        ### training discriminator
+        ### TODO We should align the batch size first then convert into the whole batch size for reward prediction, change the batch size if needed
+        irl_update_epoch = self.cfg.algorithm.get("irl_update_epoch", 1)
+        for _ in range(irl_update_epoch):
+            rollout_dataloader_iter = get_iterator_k_split(
+                discriminator_batch,
+                rollout_size // batch_size_per_rank * 2,
+            )
+            for train_global_batch in rollout_dataloader_iter:
+                train_global_batch_size = train_global_batch["normalized_actions"].shape[0]
+    
+                assert (
+                    train_global_batch_size
+                    == self.cfg.reward.global_batch_size
+                    // torch.distributed.get_world_size() 
+                )
+                assert train_global_batch_size % self.cfg.reward.micro_batch_size == 0, (
+                    f"{train_global_batch_size=}, {self.cfg.reward.micro_batch_size}"
+                )
+                ### ensure the observation chunk and the action chunk have the same first two dimensionalities
+                train_micro_batch = get_iterator_k_split(
+                    train_global_batch,
+                    train_global_batch_size // self.cfg.reward.micro_batch_size,
+                )
+
+                self.discriminator_optimizer.zero_grad()
+                for idx, data in enumerate(train_micro_batch):
+                    for k, v in data.items():
+                        data[k] = v.to(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+                    
+                    # from remote_pdb import RemotePdb
+                    # port = 14444 + (os.getpid() % 1000)
+                    # print(f"RemotePdb listening on port {port}")
+                    # RemotePdb(os.getenv("RAY_ADDRESS").split(":")[0], port).set_trace()
+
+                    backward_ctx = self.before_micro_batch(
+                        self.model,
+                        is_last_micro_batch=(idx + 1) == self.disc_gradient_accumulation,
+                    )
+
+                    with self.amp_context:
+                        disc_output = self.model(
+                            data=data,
+                            head_name="discriminator",
+                            resource="policy" 
+                        )
+                    policy_target = torch.zeros(disc_output.shape, device=disc_output.device)
+                    kwargs = {
+                        "loss_type": self.cfg.algorithm.irl_loss_type,
+                        "task_type": self.cfg.runner.task_type,
+                        "policy_input": disc_output,
+                        "policy_target": policy_target,
+                        "expert_input": disc_output,  # dummy input
+                        "expert_target": policy_target,  # dummy target
+                    }
+                    disc_loss, disc_metrics_data = policy_loss(**kwargs)
+
+                    if self.cfg.algorithm.irl_entropy_bonus > 0:
+                        entropy_kwargs = {
+                        "loss_type": self.cfg.algorithm.irl_loss_type + "_entropy",
+                        "task_type": self.cfg.runner.task_type,
+                        "policy_input": disc_output,
+                        "expert_input": disc_output,  # dummy input
+                        }
+                        disc_entropy_loss, disc_entropy_metrics_data = policy_loss(**entropy_kwargs)
+                        disc_metrics_data.update(disc_entropy_metrics_data)
+                        disc_loss -= self.cfg.algorithm.irl_entropy_bonus * disc_entropy_loss
+                    
+                    disc_loss /= self.disc_gradient_accumulation
+                    with backward_ctx:
+                        self.grad_scaler.scale(disc_loss).backward()
+
+                    disc_metrics_data["disc_loss"] = disc_loss.detach().item()
+                    append_to_dict(metrics, disc_metrics_data)
+
+                torch.cuda.empty_cache()
+
+                disc_grad_norm, disc_lr_list = self.discriminator_optimizer_step()
+                disc_data = {
+                    "discriminator/grad_norm": disc_grad_norm,
+                    "discriminator/lr": disc_lr_list[0],
+                }
+                append_to_dict(metrics, disc_data)
+        # put LR scheduler step here
+        self.discriminator_lr_scheduler.step()
+        self.discriminator_optimizer.zero_grad()
+        clear_memory()
+        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = all_reduce_dict(
+            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+
+        return mean_metric_dict
+                  
+
+        #             entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+        #             if (
+        #                 self.cfg.algorithm.entropy_bonus > 0
+        #                 and not kwargs["critic_warmup"]
+        #             ):
+        #                 entropy = output_dict["entropy"]
+        #                 entropy = reshape_entropy(
+        #                     entropy,
+        #                     entropy_type=self.cfg.algorithm.entropy_type,
+        #                     action_dim=self.cfg.actor.model.get("action_dim", 7),
+        #                     batch_size=output_dict["logprobs"].shape[0],
+        #                 )
+        #                 entropy_loss = masked_mean(entropy, mask=loss_mask)
+        #                 loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+        #             metrics_data["entropy_loss"] = entropy_loss.detach().item()
+
+        #             loss /= self.gradient_accumulation
+        #             with backward_ctx:
+        #                 self.grad_scaler.scale(loss).backward()
+
+        #             metrics_data["loss"] = loss.detach().item()
+        #             append_to_dict(metrics, metrics_data)
+
+        #         torch.cuda.empty_cache()
+
+        #         grad_norm, lr_list = self.optimizer_step()
+        #         data = {
+        #             "actor/grad_norm": grad_norm,
+        #             "actor/lr": lr_list[0],
+        #         }
+        #         if len(lr_list) > 1:
+        #             data["critic/lr"] = lr_list[1]
+        #         append_to_dict(metrics, data)
+        # # put LR scheduler step here
+        # self.lr_scheduler.step()
+        # self.optimizer.zero_grad()
+        # clear_memory()
+        # mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        # mean_metric_dict = all_reduce_dict(
+        #     mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        # )

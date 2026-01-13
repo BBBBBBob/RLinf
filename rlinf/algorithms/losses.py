@@ -15,7 +15,7 @@
 from typing import Callable, Optional
 
 import torch
-
+import torch.nn.functional as F
 from rlinf.algorithms.registry import register_policy_loss
 from rlinf.algorithms.utils import huber_loss
 from rlinf.utils.utils import masked_mean, masked_mean_ratio
@@ -274,3 +274,50 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+
+def compute_gail_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    ### max(x, 0) - x * z + log(1 + exp(-abs(x)))
+    bce_loss = torch.maximum(input, torch.zeros_like(input)) - input * target + torch.log(1 + torch.exp(-torch.abs(input)))
+    bce_loss = torch.mean(bce_loss)
+    
+    return bce_loss
+
+def compute_gail_entropy(input: torch.Tensor):
+    entropy = (1. - F.sigmoid(input)) * input - F.logsigmoid(input)
+    entropy = torch.mean(entropy)
+
+    return entropy
+
+@register_policy_loss("gail")
+def compute_gail_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
+    policy_input = kwargs.get("policy_input")
+    policy_target = kwargs.get("policy_target")
+    expert_input = kwargs.get("expert_input")
+    expert_target = kwargs.get("expert_target")
+
+    policy_bce_loss = compute_gail_loss(policy_input, policy_target)
+    expert_bce_loss = compute_gail_loss(expert_input, expert_target)
+    
+    bce_loss = (policy_bce_loss + expert_bce_loss) / 2.0
+    metrics = {
+        "discriminator/policy_bce_loss": policy_bce_loss.detach().item(),
+        "discriminator/expert_bce_loss": expert_bce_loss.detach().item(),
+    }
+
+    return bce_loss, metrics
+
+
+@register_policy_loss("gail_entropy")
+def compute_gail_entropy_fn(**kwargs) -> tuple[torch.Tensor, dict]:
+    policy_input = kwargs.get("policy_input")
+    expert_input = kwargs.get("expert_input")
+    policy_entropy_loss = compute_gail_entropy(policy_input)
+    expert_entropy_loss = compute_gail_entropy(expert_input)
+    entropy_loss = (policy_entropy_loss + expert_entropy_loss) / 2.0
+    metrics = {
+        "discriminator/policy_entropy": policy_entropy_loss.detach().item(),
+        "discriminator/expert_entropy": expert_entropy_loss.detach().item(),
+    }
+    return entropy_loss, metrics
