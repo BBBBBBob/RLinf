@@ -15,7 +15,7 @@
 import bisect
 from dataclasses import dataclass
 
-from ..hardware import AcceleratorType
+from ..hardware import AcceleratorType, HardwareInfo
 from .manager import Manager
 
 
@@ -140,6 +140,9 @@ class WorkerInfo:
     rank: int
     """Rank of the worker in the group."""
 
+    group_world_size: int
+    """World size of the worker group."""
+
     cluster_node_rank: int
     """Node ID where the worker is placed."""
 
@@ -157,6 +160,9 @@ class WorkerInfo:
 
     available_accelerators: list[int]
     """List of global accelerator IDs available to the worker."""
+
+    hardware_infos: list[HardwareInfo]
+    """List of hardware information available to the worker."""
 
     def __hash__(self):
         """Hash function for WorkerInfo."""

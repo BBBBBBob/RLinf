@@ -44,10 +44,11 @@ if not getattr(metaworld, "_has_registered_mw_envs", False):
 
 
 class MetaWorldEnv(gym.Env):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         self.seed_offset = seed_offset
         self.cfg = cfg
         self.total_num_processes = total_num_processes
+        self.worker_info = worker_info
         self.seed = self.cfg.seed + seed_offset
         self._is_start = True
         self.num_envs = num_envs
@@ -261,27 +262,19 @@ class MetaWorldEnv(gym.Env):
             }
             images_and_states_list.append(images_and_states)
 
-        obs = {
-            "images_and_states": to_tensor(
-                list_of_dict_to_dict_of_list(images_and_states_list)
-            ),
-            "task_descriptions": self.task_descriptions,
-        }
-        return obs
-
-    def _post_process_obs(self, obs):
-        image_tensor = torch.stack(
-            [
-                value.clone().permute(2, 0, 1)
-                for value in obs["images_and_states"]["full_image"]
-            ]
+        images_and_states = to_tensor(
+            list_of_dict_to_dict_of_list(images_and_states_list)
         )
-        states = obs["images_and_states"]["state"]
+
+        full_image_tensor = torch.stack(
+            [value.clone() for value in images_and_states["full_image"]]
+        )
+        states = images_and_states["state"]
 
         obs = {
-            "images": image_tensor,
+            "main_images": full_image_tensor,
             "states": states,
-            "task_descriptions": obs["task_descriptions"],
+            "task_descriptions": self.task_descriptions,
         }
         return obs
 
@@ -331,7 +324,6 @@ class MetaWorldEnv(gym.Env):
             raw_obs, _reward, _, _, _ = self.env.step(all_actions)
 
         obs = self._wrap_obs(raw_obs)
-        obs = self._post_process_obs(obs)
         if env_idx is not None:
             self._reset_metrics(env_idx)
         else:
@@ -363,8 +355,6 @@ class MetaWorldEnv(gym.Env):
                 "task": self.task_descriptions,
             }
             self.add_new_frames(obs, plot_infos)
-
-        obs = self._post_process_obs(obs)
 
         infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
@@ -465,7 +455,7 @@ class MetaWorldEnv(gym.Env):
 
     def add_new_frames(self, obs, plot_infos):
         images = []
-        obs_batch = obs["images_and_states"]["full_image"]
+        obs_batch = obs["main_images"]
         for env_id in range(obs_batch.shape[0]):
             info_item = {
                 k: v if np.size(v) == 1 else v[env_id] for k, v in plot_infos.items()

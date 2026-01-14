@@ -12,26 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from omegaconf.dictconfig import DictConfig
+import typing
 
-from rlinf.scheduler import Worker
+from rlinf.scheduler import Channel
+from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics
 
+if typing.TYPE_CHECKING:
+    from omegaconf.dictconfig import DictConfig
+
+    from rlinf.workers.env.env_worker import EnvWorker
+    from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
 
 class EmbodiedEvalRunner:
     def __init__(
         self,
-        cfg: DictConfig,
-        rollout: Worker,
-        env: Worker,
+        cfg: "DictConfig",
+        rollout: "MultiStepRolloutWorker",
+        env: "EnvWorker",
         run_timer=None,
     ):
         self.cfg = cfg
         self.rollout = rollout
         self.env = env
+
+        # Data channels
+        self.env_channel = Channel.create("Env")
+        self.rollout_channel = Channel.create("Rollout")
 
         # this timer checks if we should stop training
         self.run_timer = run_timer
@@ -41,28 +52,21 @@ class EmbodiedEvalRunner:
 
         self.logger = get_logger()
 
-    def _load_eval_policy(self):
-        self.rollout.load_checkpoint(self.cfg.runner.eval_policy_path).wait()
-
     def init_workers(self):
         self.rollout.init_worker().wait()
         self.env.init_worker().wait()
 
-        if self.cfg.runner.eval_policy_path is not None:
-            self.logger.info(
-                f"Using checkpoint for evaluation (from runner.eval_policy_path): {self.cfg.runner.eval_policy_path}"
-            )
-            self._load_eval_policy()
-        else:
-            self.logger.info(
-                f"Using checkpoint for evaluation (from rollout.model.model_path): {self.cfg.rollout.model.model_path}"
-            )
-
     def evaluate(self):
-        env_futures = self.env.evaluate()
-        rollout_futures = self.rollout.evaluate()
-        env_results = env_futures.wait()
-        rollout_futures.wait()
+        env_handle: Handle = self.env.evaluate(
+            input_channel=self.rollout_channel,
+            output_channel=self.env_channel,
+        )
+        rollout_handle: Handle = self.rollout.evaluate(
+            input_channel=self.env_channel,
+            output_channel=self.rollout_channel,
+        )
+        env_results = env_handle.wait()
+        rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics

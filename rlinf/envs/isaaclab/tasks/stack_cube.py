@@ -27,12 +27,14 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
         num_envs,
         seed_offset,
         total_num_processes,
+        worker_info,
     ):
         super().__init__(
             cfg,
             num_envs,
             seed_offset,
             total_num_processes,
+            worker_info,
         )
 
     def _make_env_function(self):
@@ -67,8 +69,8 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
 
     def _wrap_obs(self, obs):
         instruction = [self.task_description] * self.num_envs
-        wrist_image = obs["policy"]["wrist_cam"].permute(0, 3, 1, 2)
-        table_image = obs["policy"]["table_cam"].permute(0, 3, 1, 2)
+        wrist_image = obs["policy"]["wrist_cam"]
+        table_image = obs["policy"]["table_cam"]
         states = torch.concatenate(
             [
                 obs["policy"]["eef_pos"],
@@ -79,7 +81,7 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
         )
 
         env_obs = {
-            "images": table_image,
+            "main_images": table_image,
             "task_descriptions": instruction,
             "states": states,
             "wrist_images": wrist_image,

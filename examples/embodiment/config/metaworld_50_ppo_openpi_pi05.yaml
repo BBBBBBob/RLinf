@@ -22,20 +22,18 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "test_openpi"
+    experiment_name: "metaworld_50_ppo_openpi_pi05"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
   max_steps: -1
 
   only_eval: False
-  eval_policy_path: null # Optional: .pt file or None, if None, will use the checkpoint in rollout.model.model_path
   val_check_interval: -1
   save_interval: 50
-  seq_length: 4096
-  max_prompt_length: 50
 
-  resume_dir: null
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   normalize_advantages: True
@@ -87,10 +85,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  channel:
-    name: "env_buffer_list"
-    queue_name: "obs_buffer"
-    queue_size: 0
   enable_offload: False
 
   # Override the default values in env/metaworld_50
@@ -110,11 +104,6 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "action_buffer"
-    queue_size: 0
-  mode: "colocate"
   generation_backend: "huggingface"
   recompute_logprobs: False
   unnorm_key: libero_10
@@ -127,10 +116,6 @@ rollout:
 
 actor:
   group_name: "ActorGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "replay_buffer"
-    queue_size: 0
   training_backend: "fsdp"
   micro_batch_size: 128
   global_batch_size: 2048 # maximum : global batch size = micro batch size * actor num_processes.
@@ -155,11 +140,12 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
+    weight_decay: 0.01
     clip_grad: 1.0
     critic_warmup_steps: 0
     total_training_steps: ${runner.max_epochs}
     lr_warmup_steps: -1
-    warmup_style: cosine
+    lr_scheduler: "cosine" # Learning rate scheduler type. Choices: ["constant", "cosine"]. Default: "constant".
     num_cycles: 0.5
 
   # Override the default values in training_backend/fsdp

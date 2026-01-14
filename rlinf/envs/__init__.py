@@ -12,36 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import Enum
 
-def get_env_cls(simulator_type, env_cfg=None):
+
+class SupportedEnvType(Enum):
+    MANISKILL = "maniskill"
+    LIBERO = "libero"
+    ROBOTWIN = "robotwin"
+    ISAACLAB = "isaaclab"
+    METAWORLD = "metaworld"
+    BEHAVIOR = "behavior"
+    CALVIN = "calvin"
+    ROBOCASA = "robocasa"
+    REALWORLD = "realworld"
+    FRANKASIM = "frankasim"
+
+
+def get_env_cls(env_type: str, env_cfg=None, enable_offload=False):
     """
-    Get environment class based on simulator type.
+    Get environment class based on environment type.
 
     Args:
-        simulator_type: Type of simulator (e.g., "maniskill", "libero", "isaaclab", etc.)
-        env_cfg: Optional environment configuration. Required for "isaaclab" simulator type.
+        env_type: Type of environment (e.g., "maniskill", "libero", "isaaclab", etc.)
+        env_cfg: Optional environment configuration. Required for "isaaclab" environment type.
 
     Returns:
-        Environment class corresponding to the simulator type.
+        Environment class corresponding to the environment type.
     """
-    if simulator_type == "maniskill":
-        from rlinf.envs.maniskill.maniskill_env import ManiskillEnv
+
+    env_type = SupportedEnvType(env_type)
+
+    if env_type == SupportedEnvType.MANISKILL:
+        if not enable_offload:
+            from rlinf.envs.maniskill.maniskill_env import ManiskillEnv
+        else:
+            from rlinf.envs.maniskill.maniskill_offload_env import (
+                ManiskillOffloadEnv as ManiskillEnv,
+            )
 
         return ManiskillEnv
-    elif simulator_type == "libero":
+    elif env_type == SupportedEnvType.LIBERO:
         from rlinf.envs.libero.libero_env import LiberoEnv
 
         return LiberoEnv
-    elif simulator_type == "robotwin":
-        from rlinf.envs.robotwin.RoboTwin_env import RoboTwin
+    elif env_type == SupportedEnvType.ROBOTWIN:
+        from rlinf.envs.robotwin.robotwin_env import RoboTwinEnv
 
-        return RoboTwin
-    elif simulator_type == "isaaclab":
+        return RoboTwinEnv
+    elif env_type == SupportedEnvType.ISAACLAB:
         from rlinf.envs.isaaclab import REGISTER_ISAACLAB_ENVS
 
         if env_cfg is None:
             raise ValueError(
-                "env_cfg is required for isaaclab simulator type. "
+                "env_cfg is required for isaaclab environment type. "
                 "Please provide env_cfg.init_params.id to select the task."
             )
 
@@ -51,17 +74,29 @@ def get_env_cls(simulator_type, env_cfg=None):
             f"Available tasks: {list(REGISTER_ISAACLAB_ENVS.keys())}"
         )
         return REGISTER_ISAACLAB_ENVS[task_id]
-    elif simulator_type == "metaworld":
+    elif env_type == SupportedEnvType.METAWORLD:
         from rlinf.envs.metaworld.metaworld_env import MetaWorldEnv
 
         return MetaWorldEnv
-    elif simulator_type == "behavior":
+    elif env_type == SupportedEnvType.BEHAVIOR:
         from rlinf.envs.behavior.behavior_env import BehaviorEnv
 
         return BehaviorEnv
-    elif simulator_type == "calvin":
+    elif env_type == SupportedEnvType.CALVIN:
         from rlinf.envs.calvin.calvin_gym_env import CalvinEnv
 
         return CalvinEnv
+    elif env_type == SupportedEnvType.ROBOCASA:
+        from rlinf.envs.robocasa.robocasa_env import RobocasaEnv
+
+        return RobocasaEnv
+    elif env_type == SupportedEnvType.REALWORLD:
+        from rlinf.envs.realworld.realworld_env import RealWorldEnv
+
+        return RealWorldEnv
+    elif env_type == SupportedEnvType.FRANKASIM:
+        from rlinf.envs.frankasim.frankasim_env import FrankaSimEnv
+
+        return FrankaSimEnv
     else:
-        raise NotImplementedError(f"Simulator type {simulator_type} not implemented")
+        raise NotImplementedError(f"Environment type {env_type} not implemented")

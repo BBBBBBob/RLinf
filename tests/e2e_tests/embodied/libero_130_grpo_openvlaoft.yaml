@@ -31,8 +31,6 @@ runner:
   only_eval: False
   val_check_interval: -1
   save_interval: -1
-  seq_length: 4096
-  max_prompt_length: 128
 
 algorithm:
   normalize_advantages: True
@@ -82,10 +80,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  channel:
-    name: "env_buffer_list"
-    queue_name: "obs_buffer"
-    queue_size: 0
   enable_offload: False
 
   # Override the default values in env/libero_130
@@ -111,11 +105,6 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "action_buffer"
-    queue_size: 0
-  mode: "colocate"
   generation_backend: "huggingface"
   enable_offload: True
   pipeline_stage_num: 1
@@ -126,10 +115,6 @@ rollout:
 
 actor:
   group_name: "ActorGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "replay_buffer"
-    queue_size: 0
   training_backend: "fsdp"
   micro_batch_size: 2
   global_batch_size: 256
@@ -145,6 +130,7 @@ actor:
     value_type: ${algorithm.reward_type}  # 'action' or 'token'
 
     unnorm_key: libero_130_no_noops_trajall
+    max_prompt_length: 128
 
   optim:
     lr: 2.0e-5
@@ -152,14 +138,8 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-05
+    weight_decay: 0.01
     clip_grad: 1.0
-
-  tokenizer:
-    tokenizer_type: "HuggingFaceTokenizer"
-    tokenizer_model: "/workspace/dataset/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora"
-    use_fast: False
-    trust_remote_code: True
-    padding_side: "right"
 
   # Override the default values in training_backend/fsdp
   fsdp_config:

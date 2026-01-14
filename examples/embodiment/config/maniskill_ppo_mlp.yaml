@@ -24,20 +24,18 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "test_openvla"
+    experiment_name: "maniskill_ppo_mlp"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
   max_steps: -1
 
   only_eval: False
-  eval_policy_path: null # Optional: .pt file or None, if None, will use the checkpoint in rollout.model.model_path
   val_check_interval: 50
   save_interval: -1
-  seq_length: 4096
-  max_prompt_length: 30
 
-  resume_dir: null
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   update_epoch: 8
@@ -84,10 +82,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  channel:
-    name: "env_buffer_list"
-    queue_name: "obs_buffer"
-    queue_size: 0
   enable_offload: False
 
   # Override the default values in env/maniskill_pick_cube
@@ -111,11 +105,6 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "action_buffer"
-    queue_size: 0
-  mode: "colocate"
   backend: "huggingface"
   enable_offload: False
   pipeline_stage_num: 1
@@ -126,10 +115,6 @@ rollout:
 
 actor:
   group_name: "ActorGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "replay_buffer"
-    queue_size: 0
   training_backend: "fsdp"
   micro_batch_size: 6400
   global_batch_size: 6400
@@ -147,6 +132,7 @@ actor:
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-05
+    weight_decay: 0.01
     clip_grad: 0.5
 
   # Override the default values in training_backend/fsdp

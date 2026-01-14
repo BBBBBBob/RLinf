@@ -22,20 +22,18 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "test_gr00t"
+    experiment_name: "libero_spatial_ppo_gr00t"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
   max_steps: -1
 
   only_eval: False
-  eval_policy_path: null # Optional: .pt file or None, if None, will use the checkpoint in rollout.model.model_path
   val_check_interval: -1
   save_interval: 100
-  seq_length: 4096
-  max_prompt_length: 30
 
-  resume_dir: null
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   normalize_advantages: True
@@ -49,7 +47,7 @@ algorithm:
   logprob_type: chunk_level
   entropy_type: chunk_level
 
-  update_epoch: 1
+  update_epoch: 4
   adv_type: gae
   loss_type: actor_critic
   loss_agg_func: "token-mean" 
@@ -86,10 +84,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  channel:
-    name: "env_buffer_list"
-    queue_name: "obs_buffer"
-    queue_size: 0
   enable_offload: False
 
   # Override the default values in env/libero_spatial
@@ -111,11 +105,6 @@ env:
 
 rollout:
   group_name: "RolloutGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "action_buffer"
-    queue_size: 0
-  mode: "colocate"
   backend: "huggingface"
   enable_offload: True
   pipeline_stage_num: 1
@@ -126,10 +115,6 @@ rollout:
 
 actor:
   group_name: "ActorGroup"
-  channel:
-    name: ${env.channel.name}
-    queue_name: "replay_buffer"
-    queue_size: 0
   training_backend: "fsdp"
   micro_batch_size: 128
   global_batch_size: 1024
@@ -143,11 +128,12 @@ actor:
     add_value_head: True
 
   optim:
-    lr: 2.0e-5
-    value_lr: 2.0e-5
+    lr: 5.0e-6
+    value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-05
+    weight_decay: 0.01
     clip_grad: 1.0
     critic_warmup_steps: 0
   

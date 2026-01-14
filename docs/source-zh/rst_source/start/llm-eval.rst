@@ -1,4 +1,4 @@
-评估 2：数学推理场景
+评估教程2：数学推理LLM
 =================================
 
 简介
@@ -37,7 +37,7 @@
 
 模型转换
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-在训练过程中，模型以 Megatron 格式被存储下来。 你可以使用位于 ``RLinf/toolkits/ckpt_convertor/`` 的转换脚本将其转换为 Huggingface 格式。
+在训练过程中，模型以 Megatron 格式被存储下来。 你可以使用位于 ``RLinf/toolkits/ckpt_convertor/megatron_convertor/`` 的转换脚本将其转换为 Huggingface 格式。
 
 你有两种方式使用脚本：
 

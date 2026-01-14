@@ -41,10 +41,11 @@ from rlinf.envs.utils import (
 
 
 class LiberoEnv(gym.Env):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         self.seed_offset = seed_offset
         self.cfg = cfg
         self.total_num_processes = total_num_processes
+        self.worker_info = worker_info
         self.seed = self.cfg.seed + seed_offset
         self._is_start = True
         self.num_envs = num_envs
@@ -277,23 +278,17 @@ class LiberoEnv(gym.Env):
             list_of_dict_to_dict_of_list(images_and_states_list)
         )
 
-        image_tensor = torch.stack(
-            [
-                value.clone().permute(2, 0, 1)
-                for value in images_and_states["full_image"]
-            ]
+        full_image_tensor = torch.stack(
+            [value.clone() for value in images_and_states["full_image"]]
         )
         wrist_image_tensor = torch.stack(
-            [
-                value.clone().permute(2, 0, 1)
-                for value in images_and_states["wrist_image"]
-            ]
+            [value.clone() for value in images_and_states["wrist_image"]]
         )
 
         states = images_and_states["state"]
 
         obs = {
-            "images": image_tensor,
+            "main_images": full_image_tensor,
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,

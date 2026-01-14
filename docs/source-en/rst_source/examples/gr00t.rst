@@ -48,8 +48,8 @@ Environment
 
 **Data Structure**
 
--  **Images**: Main-view and wrist-view RGB tensors, respectively named as "images" and "wrist_images" with shape
-   ``[batch_size, 3, 224, 224]``
+-  **Images**: Main-view and wrist-view RGB tensors, respectively named as "main_images" and "wrist_images" with shape
+   ``[batch_size, 224, 224, 3]``
 -  **States**: End-effector position, orientation, and gripper state
 -  **Task Descriptions**: Natural-language instructions
 -  **Rewards**: Sparse success/failure rewards
@@ -75,9 +75,33 @@ Algorithm
 Dependency Installation
 -----------------------
 
+1. Clone RLinf Repository
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code:: bash
+
+   # For mainland China users, you can use the following for better download speed:
+   # git clone https://ghfast.top/github.com/RLinf/RLinf.git
+   git clone https://github.com/RLinf/RLinf.git
+   cd RLinf
+
+2. Install Dependencies
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 **Option 1: Docker Image**
 
-Use the Docker image ``rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0`` for the experiment.
+Use Docker image for the experiment.
+
+.. code:: bash
+
+   docker run -it --rm --gpus all \
+      --shm-size 20g \
+      --network host \
+      --name rlinf \
+      -v .:/workspace/RLinf \
+      rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0
+      # For mainland China users, you can use the following for better download speed:
+      # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0
 
 Please switch to the corresponding virtual environment via the built-in `switch_env` utility in the image:
 
@@ -91,7 +115,8 @@ Install dependencies directly in your environment by running the following comma
 
 .. code:: bash
 
-   pip install uv
+   # For mainland China users, you can add the `--use-mirror` flag to the install.sh command for better download speed.
+
    bash requirements/install.sh embodied --model gr00t --env maniskill_libero
    source .venv/bin/activate
 
@@ -111,8 +136,10 @@ In current stage, we support four libero tasks: Spatial, Object, Goal, and Long.
    git clone https://huggingface.co/RLinf/RLinf-Gr00t-SFT-Spatial
 
    # Method 2: Using huggingface-hub
+   # For mainland China users, you can use the following for better download speed:
+   # export HF_ENDPOINT=https://hf-mirror.com
    pip install huggingface-hub
-   hf download RLinf/RLinf-Gr00t-SFT-Spatial
+   hf download RLinf/RLinf-Gr00t-SFT-Spatial --local-dir RLinf-Gr00t-SFT-Spatial
 
 Models for other tasks:
 - `Libero-Object <https://huggingface.co/lixiang-95/RLinf-Gr00t-SFT-Object>`_
@@ -178,11 +205,10 @@ Running Scripts
       pipeline_stage_num: 2
 
 Here you can flexibly configure the GPU count for env, rollout, and
-actor components. Using the above configuration, you can achieve
-pipeline overlap between env and rollout, and sharing with actor.
+actor components. 
 Additionally, by setting ``pipeline_stage_num = 2`` in the
 configuration, you can achieve pipeline overlap between rollout and
-actor, improving rollout efficiency.
+env, improving rollout efficiency.
 
 .. code:: yaml
 
@@ -321,7 +347,7 @@ Visualization and Results
      logger:
        log_path: "../results"
        project_name: rlinf
-       experiment_name: "test_openpi"
+       experiment_name: "libero_10_ppo_gr00t"
        logger_backends: ["tensorboard", "wandb"] # tensorboard, wandb, swanlab
 
 --------------
