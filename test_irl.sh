@@ -3,7 +3,7 @@ mkdir -p "$RAY_TMPDIR"
 
 JOB_ID=${SLURM_JOB_ID:-0}
 # Keep ports comfortably low and below 65535
-BASE=$(( (JOB_ID % 200) * 50 )) 
+BASE=$(( (JOB_ID % 200) * 20 )) 
 
 export RAY_PORT=$((2000 + BASE))
 export RAY_DASHBOARD_PORT=$((6000 + BASE))

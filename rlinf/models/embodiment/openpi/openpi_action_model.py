@@ -767,14 +767,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains_entropy.append(entropy)
 
             ### optimize the value computation if use_vlm_value is True
-            # if self.use_vlm_value:
-            #     chains_values.append(self.get_value_from_vlm(prefix_output))
+            if self.use_vlm_value:
+                chains_values.append(self.get_value_from_vlm(prefix_output))
             if not self.use_vlm_value:
                 chains_values.append(value_t)
 
-        chains_log_probs = torch.stack(chains_log_probs, dim=1)
         if self.use_vlm_value:
             chains_values.append(self.get_value_from_vlm(prefix_output))
+            
+        chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
         # entropy is only available for flow-noise method
         if self.config.noise_method == "flow_noise":
@@ -840,7 +841,7 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
         config: OpenPi0Config,
     ):
         super().__init__(config)
-        
+        # self.discriminator_head = None
         self.discriminator_head = DiscriminatorHead(
             input_dim=1024,
             hidden_sizes=(512, 256, 128),
@@ -848,8 +849,10 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
             activation="relu",
             bias_last=True,
         )
+        self.discriminator_head = self.discriminator_head.to(
+                dtype=self.action_out_proj.weight.dtype
+            )
     
-    ### TODO normalized the demonstration action, normalize the action before input
     def demo_action_transform(self, demo_action: dict):
         ### make sure the input here is 32?
         # split & transform
@@ -870,21 +873,24 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
     def obs_processor(self, env_obs):
         # base observation
         processed_obs = {
-            "observation/image": env_obs["images"],
+            "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],
         }
-        # state observation
+        # state observation - ensure float32 to prevent BFloat16 conversion issues
         if "calvin" in self.config.config_name:
             state = env_obs["states"]
             processed_obs["observation/state_ee_pos"] = state[:, :3]
             processed_obs["observation/state_ee_rot"] = state[:, 3:6]
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
-            processed_obs["observation/state"] = env_obs["states"]
+            state = env_obs["states"]
+            if torch.is_tensor(state):
+                state = state.to(dtype=torch.float32)
+            processed_obs["observation/state"] = state
         # wrist image observation
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
-        # last extracted image
+        # store used keys
         if "next_image" in env_obs:
             processed_obs["observation/next_image"] = env_obs["next_image"]
         return processed_obs
@@ -922,7 +928,7 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
             env_obs.update({"next_image": data["next_obs"]})
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs, change the keys
         processed_obs = self.input_transform(
-            to_process_obs
+            to_process_obs, transpose= False
         )  # policy input obs -> model input obs, normalizing the images
         processed_obs = self.precision_processor(
             processed_obs
@@ -948,13 +954,13 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
 
         return rewards
         # return rewards, to_process_obs["observation/next_image"].cpu().contiguous()
-    
+
     def predict_action_batch(
-        self, env_obs, mode: Literal["train", "eval"] = "train", compute_values=True
+        self, env_obs, mode: Literal["train", "eval"] = "train", compute_values=True, return_obs=True
     ) -> tuple[np.ndarray, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
-            to_process_obs
+            to_process_obs, transpose= False
         )  # policy input obs -> model input obs
         processed_obs = self.precision_processor(
             processed_obs
@@ -983,7 +989,7 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
         }
         return actions, result
     
-    def forward(
+    def default_forward(
         self,
         data: dict[str, torch.Tensor],
         head_name: str = "actor_critic",
@@ -996,7 +1002,7 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
             denoise_inds = data["denoise_inds"]
             
             # input transform
-            observation = self.input_transform(data)
+            observation = self.input_transform(data, transpose=False)
             observation = _model.Observation.from_dict(observation)
             images, img_masks, lang_tokens, lang_masks, state = (
                 self._preprocess_observation(observation, train=False)
@@ -1036,7 +1042,7 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
             }
         elif head_name == "discriminator":
             ## If the data comes from the policy
-            observation = self.input_transform(data)
+            observation = self.input_transform(data, transpose=False)
             observation = self.precision_processor(observation)
             observation = _model.Observation.from_dict(observation)
 

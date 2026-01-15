@@ -92,6 +92,7 @@ class FSDPModelManager:
 
         self.is_weight_offloaded = False
         self.is_optimizer_offloaded = False
+        self.is_disc_optimizer_offloaded = False
 
     def _create_amp_context(self) -> ContextManager:
         """
@@ -237,7 +238,7 @@ class FSDPModelManager:
         Setup model, lr_scheduler, optimizer and grad_scaler.
         """
         module = self.model_provider_func()
-
+ 
         # Enable gradient checkpointing if configured
         if self._cfg.fsdp_config.get("gradient_checkpointing", False):
             self._logger.info("[FSDP] Enabling gradient checkpointing")
@@ -286,8 +287,6 @@ class FSDPModelManager:
         Args:
             load_path: the directory to load checkpoint.
         """
-        optimizers = self.optimizer
-        lr_schedulers = self.lr_scheduler
         if self._cfg.use_reward_model:
             optimizers = {
                 "main": self.optimizer,
@@ -298,7 +297,10 @@ class FSDPModelManager:
                 "discriminator": self.discriminator_lr_scheduler,
             }
         self._strategy.load_checkpoint(
-            self.model, optimizers, lr_schedulers, load_path
+            self.model, 
+            self.optimizer if not self._cfg.use_reward_model else optimizers, 
+            self.lr_scheduler if not self._cfg.use_reward_model else lr_schedulers, 
+            load_path
         )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
@@ -309,9 +311,17 @@ class FSDPModelManager:
         Args:
             save_path: the directory to save checkpoint.
         """
-        optimizers = self.optimizer
-        lr_schedulers = self.lr_scheduler
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+            self.is_weight_offloaded = False
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+            self.is_optimizer_offloaded = False
+
         if self._cfg.use_reward_model:
+            if self.is_disc_optimizer_offloaded:
+                self.load_discriminator_optimizer(self.device)
+                self.is_disc_optimizer_offloaded = False
             optimizers = {
                 "main": self.optimizer,
                 "discriminator": self.discriminator_optimizer,
@@ -320,17 +330,11 @@ class FSDPModelManager:
                 "main": self.lr_scheduler,
                 "discriminator": self.discriminator_lr_scheduler,
             }
-        if self.is_weight_offloaded:
-            self.load_param_and_grad(self.device)
-            self.is_weight_offloaded = False
-        if self.is_optimizer_offloaded:
-            self.load_optimizer(self.device)
-            self.is_optimizer_offloaded = False
 
         self._strategy.save_checkpoint(
             self.model,
-            optimizers,
-            lr_schedulers,
+            self.optimizer if not self._cfg.use_reward_model else optimizers,
+            self.lr_scheduler if not self._cfg.use_reward_model else lr_schedulers,
             save_path,
         )
 
@@ -566,6 +570,7 @@ class FSDPModelManager:
         Offload optimizer states to CPU.
         """
         self._strategy.offload_optimizer(self.discriminator_optimizer)
+        self.is_disc_optimizer_offloaded = True
 
     def load_discriminator_optimizer(self, device_id: int) -> None:
         """
@@ -575,6 +580,7 @@ class FSDPModelManager:
             device_id: the target device id to load optimizer states.
         """
         self._strategy.onload_optimizer(self.discriminator_optimizer, device_id)
+        self.is_disc_optimizer_offloaded = False
 
     def discriminator_optimizer_step(self) -> tuple[float, list[float]]:
         """

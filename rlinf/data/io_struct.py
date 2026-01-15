@@ -1282,6 +1282,8 @@ class EnvOutput:
 class RolloutEnvOutput:
     obs: dict[str, Any]
     dones: Optional[torch.Tensor] = None
+    terminations: Optional[torch.Tensor] = None
+    truncations: Optional[torch.Tensor] = None 
 
     def __post_init__(self):
         self.obs = put_tensor_cpu(self.obs)
@@ -1290,45 +1292,100 @@ class RolloutEnvOutput:
             if self.dones is not None
             else None
         )
+        self.terminations = (
+            self.terminations.cpu().contiguous()
+            if self.terminations is not None
+            else None
+        )
+        self.truncations = (
+            self.truncations.cpu().contiguous()
+            if self.truncations is not None
+            else None
+        )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
-        image_tensor = obs["images"] if "images" in obs else None
+        image_tensor = obs["main_images"] if "main_images" in obs else None
         wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+        extra_view_image_tensor = (
+            obs["extra_view_images"] if "extra_view_images" in obs else None
+        )
         states = obs["states"] if "states" in obs else None
         task_descriptions = (
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
 
         return {
-            "images": image_tensor,
-            "wrist_images": wrist_image_tensor,
+            "main_images": image_tensor,  # [N_ENV, H, W, C]
+            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
+            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
+            "states": states,
+            "task_descriptions": task_descriptions,
+        }
+    
+    def to_dict(self):
+        rollout_env_output_dict = {}
+        rollout_env_output_dict["obs"] = self.prepare_observations(self.obs)
+        rollout_env_output_dict["dones"] = self.dones
+        rollout_env_output_dict["terminations"] = self.terminations
+        rollout_env_output_dict["truncations"] = self.truncations
+
+        return rollout_env_output_dict
+
+
+@dataclass(kw_only=True)
+class RewardEnvOutput:
+    obs: dict[str, Any]
+    final_obs: Optional[dict[str, Any]] = None
+    dones: Optional[torch.Tensor] = None  # [B]
+    rewards: Optional[torch.Tensor] = None  # [B]
+    normalized_actions: torch.Tensor
+    next_obs: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.obs = put_tensor_device(self.obs, "cpu")
+        self.final_obs = (
+            put_tensor_device(self.final_obs, "cpu")
+            if self.final_obs is not None
+            else None
+        )
+        self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
+        self.rewards = (
+            self.rewards.cpu().contiguous() if self.rewards is not None else None
+        )
+        self.normalized_actions = self.normalized_actions.cpu().contiguous()
+        self.next_obs = self.next_obs.cpu().contiguous() if self.next_obs is not None else None
+
+    @staticmethod
+    def prepare_observations(obs: dict[str, Any]) -> dict[str, Any]:
+        image_tensor = obs["main_images"] if "main_images" in obs else None
+        wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+        extra_view_image_tensor = (
+            obs["extra_view_images"] if "extra_view_images" in obs else None
+        )
+        states = obs["states"] if "states" in obs else None
+        task_descriptions = (
+            list(obs["task_descriptions"]) if "task_descriptions" in obs else None
+        )
+
+        return {
+            "main_images": image_tensor,  # [N_ENV, H, W, C]
+            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
+            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }
 
     def to_dict(self):
-        rollout_env_output_dict = {}
-        rollout_env_output_dict["obs"] = self.prepare_observations(self.obs)
-        rollout_env_output_dict["dones"] = self.dones
-
-        return rollout_env_output_dict
-
-@dataclass(kw_only=True)
-class RewardEnvOutput(EnvOutput):
-    normalized_actions: torch.Tensor
-    next_obs: Optional[torch.Tensor] = None
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.normalized_actions = self.normalized_actions.cpu().contiguous()
-        self.next_obs = self.next_obs.cpu().contiguous() if self.next_obs is not None else None
-
-    def to_dict(self):
-        reward_env_output_dict = super().to_dict()
-        reward_env_output_dict["normalized_actions"] = self.normalized_actions
-        reward_env_output_dict["next_obs"] = self.next_obs
-
-        return reward_env_output_dict
+        return {
+            "obs": self.prepare_observations(self.obs),
+            "final_obs": self.prepare_observations(self.final_obs)
+            if self.final_obs is not None
+            else None,
+            "dones": self.dones,
+            "rewards": self.rewards,
+            "normalized_actions": self.normalized_actions,
+            "next_obs": self.next_obs,
+        }
 
 
 @dataclass(kw_only=True)

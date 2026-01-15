@@ -164,6 +164,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, is_openvla_model=Fa
         )
         policies.append(value_head_policy)
 
+    if hasattr(module, "discriminator_head"):
+        from rlinf.models.embodiment.modules.discriminator_head import DiscriminatorHead
+
+        discriminator_head_policy = functools.partial(
+            _module_wrap_policy, module_classes={DiscriminatorHead}
+        )
+        policies.append(discriminator_head_policy)
+
     if hasattr(module, "q_head"):
         from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 

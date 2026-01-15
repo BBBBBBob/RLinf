@@ -1120,64 +1120,87 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         super().__init__(cfg)
         ### TODO add dataloader for expert demonstrations
         self._reward_group_name = cfg.reward.group_name
-        self._weight_dst_rank_in_reward = self._rank
-        if self._weight_dst_rank_in_reward >= self._component_placement.get_world_size(
-            "reward"
-        ):
-            self._weight_dst_rank_in_reward = None
+        self.disc_enable_offload = self.cfg.reward.get("enable_offload", False)
+
+    def _setup_reward_weight_dst_ranks(self) -> None:
+        reward_world_size = self._component_placement.get_world_size("reward")
+        actor_world_size = self._world_size
+        rank = self._rank
+        self._weight_dst_rank_in_reward = []
+        reward_ranks_per_actor = (
+            reward_world_size + actor_world_size - 1
+        ) // actor_world_size
+        for i in range(reward_ranks_per_actor):
+            if i * actor_world_size + rank < reward_world_size:
+                self._weight_dst_rank_in_reward.append(i * actor_world_size + rank)
 
     def init_worker(self):
         self.setup_model_and_optimizer()
 
-        if self.cfg.actor.get("enable_offload", False):
+        if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
+
+        if self.disc_enable_offload:
+            self.offload_discriminator_optimizer()
         
-        if self.cfg.reward.get("enable_offload", False):
+        self._setup_rollout_weight_dst_ranks()
+        self._setup_reward_weight_dst_ranks()
+
+    def sync_model_to_rollout(self) -> None:
+        """
+        Sync the model's full state dict to the rollout worker.
+        """
+        if self.enable_offload and not self.is_optimizer_offloaded:
+            self.offload_optimizer()
+
+        if self.disc_enable_offload and not self.is_disc_optimizer_offloaded:
             self.offload_discriminator_optimizer()
 
-    def sync_model_to_rollout(self):
-        if self.cfg.actor.get("enable_offload", False):
-            self.offload_optimizer()
-            # self.offload_discriminator_optimizer()
+        if self.enable_offload and self.disc_enable_offload and self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
 
-        if next(self.model.parameters()).is_cpu:
-            if self.cfg.actor.get("enable_offload", False):
-                self.load_param_and_grad(self.device)
-
-        state_dict = self.get_model_state_dict()
-        if self._weight_dst_rank_in_rollout is not None:
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        for rank in self._weight_dst_rank_in_rollout:
             self.send(
-                state_dict, self._rollout_group_name, self._weight_dst_rank_in_rollout
+                state_dict,
+                self._rollout_group_name,
+                rank,
+                async_op=True,
             )
-
-        if self.cfg.actor.get("enable_offload", False):
+        if self.enable_offload and self.disc_enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
-    def sync_model_to_reward(self):
-        if self.cfg.reward.get("enable_offload", False):
-            # self.offload_optimizer()
+    def sync_model_to_reward(self) -> None:
+        """
+        Sync the model's full state dict to the reward worker.
+        """
+        if self.enable_offload and not self.is_optimizer_offloaded:
+            self.offload_optimizer()
+
+        if self.disc_enable_offload and not self.is_disc_optimizer_offloaded:
             self.offload_discriminator_optimizer()
-            
-        if next(self.model.parameters()).is_cpu:
-            if self.cfg.reward.get("enable_offload", False):
-                self.load_param_and_grad(self.device)
 
-        state_dict = self.get_model_state_dict()
-        if self._weight_dst_rank_in_reward is not None:
+        if self.enable_offload and self.disc_enable_offload and self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        for rank in self._weight_dst_rank_in_reward:
             self.send(
-                state_dict, self._reward_group_name, self._weight_dst_rank_in_reward
+                state_dict,
+                self._reward_group_name,
+                rank,
+                async_op=True,
             )
-
-        if self.cfg.reward.get("enable_offload", False):
+        if self.enable_offload and self.disc_enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
     def run_training(self):
-        if self.cfg.actor.get("enable_offload", False):
+        if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
-        
-        if self.cfg.reward.get("enable_offload", False):
+        if self.is_disc_optimizer_offloaded:
             self.load_discriminator_optimizer(self.device)
 
         self.model.train()
@@ -1190,15 +1213,9 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         shuffle_id = torch.randperm(rollout_size, generator=g)
     
         with torch.no_grad():
-            for key, value in self.rollout_batch.items():
-                if key in ["dones", "prev_values"]:
-                    value = value[:-1]
-                if "env_info" in key:
-                    continue
-                if value is None:
-                    continue
-                value = value.reshape(rollout_size, *value.shape[2:])
-                self.rollout_batch[key] = value[shuffle_id]
+            self.rollout_batch = process_nested_dict_for_train(
+                self.rollout_batch, shuffle_id
+            )
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1207,9 +1224,9 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         ), "global_batch_size is not divisible by micro_batch_size * world_size"
 
         ### filter out observation/next_image
-        ### TODO is this in-place operation?
         actor_critic_batch = {}
         discriminator_batch = {}
+
         for key, value in self.rollout_batch.items():
             if key != "observation/next_image":
                 actor_critic_batch[key] = value
@@ -1238,6 +1255,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
+
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
 
@@ -1264,8 +1282,9 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                 self.optimizer.zero_grad()
                 for idx, data in enumerate(train_micro_batch):
-                    for k, v in data.items():
-                        data[k] = v.to(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+                    data = put_tensor_device(
+                        data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                    )
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
@@ -1367,12 +1386,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
-        # mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
-        # mean_metric_dict = all_reduce_dict(
-        #     mean_metric_dict, op=torch.distributed.ReduceOp.AVG
-        # )
-
-        # return mean_metric_dict
 
         ### training discriminator
         ### TODO We should align the batch size first then convert into the whole batch size for reward prediction, change the batch size if needed
@@ -1401,14 +1414,9 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                 self.discriminator_optimizer.zero_grad()
                 for idx, data in enumerate(train_micro_batch):
-                    for k, v in data.items():
-                        data[k] = v.to(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-                    
-                    # from remote_pdb import RemotePdb
-                    # port = 14444 + (os.getpid() % 1000)
-                    # print(f"RemotePdb listening on port {port}")
-                    # RemotePdb(os.getenv("RAY_ADDRESS").split(":")[0], port).set_trace()
-
+                    data = put_tensor_device(
+                        data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                    )
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.disc_gradient_accumulation,

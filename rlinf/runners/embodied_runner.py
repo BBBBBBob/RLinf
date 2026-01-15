@@ -38,7 +38,7 @@ if TYPE_CHECKING:
         AsyncMultiStepRolloutWorker,
     )
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker, IRLMultiStepRolloutWorker
-from rlinf.workers.reward.irl_reward_worker import IRLRewardWorker
+    from rlinf.workers.reward.irl_reward_worker import IRLRewardWorker
 
 
 class EmbodiedRunner:
@@ -254,10 +254,10 @@ class IRLEmbodiedRunner:
     def __init__(
         self,
         cfg: DictConfig,
-        actor: IRLEmbodiedFSDPActor,
-        rollout: IRLMultiStepRolloutWorker,
-        env: IRLEnvWorker,
-        reward: IRLRewardWorker,
+        actor: "IRLEmbodiedFSDPActor",
+        rollout: "IRLMultiStepRolloutWorker",
+        env: "IRLEnvWorker",
+        reward: "IRLRewardWorker",
         critic=None,
         run_timer=None,
     ):
@@ -268,6 +268,10 @@ class IRLEmbodiedRunner:
         self.critic = critic
         self.reward = reward
 
+        self.env_channel = Channel.create("Env")
+        self.rollout_channel = Channel.create("Rollout")
+        self.actor_channel = Channel.create("Actor")
+        self.reward_channel = Channel.create("Reward")
         # this timer checks if we should stop training
         self.run_timer = run_timer
 
@@ -288,6 +292,7 @@ class IRLEmbodiedRunner:
         self.rollout.init_worker().wait()
         self.env.init_worker().wait()
         self.reward.init_worker().wait()
+
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
             return
@@ -299,41 +304,47 @@ class IRLEmbodiedRunner:
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
-    def update_rollout_weights(self):
-        rollout_futures = self.rollout.sync_model_from_actor()
-        reward_futures = self.reward.sync_model_from_actor()
-        actor_rollout_futures = self.actor.sync_model_to_rollout()
-        actor_reward_futures = self.actor.sync_model_to_reward()
+    def update_weights(self):
+        rollout_handle: Handle = self.rollout.sync_model_from_actor()
+        reward_handle: Handle = self.reward.sync_model_from_actor()
+        actor_rollout_handle: Handle = self.actor.sync_model_to_rollout()
+        actor_reward_handle: Handle = self.actor.sync_model_to_reward()
         
-        actor_reward_futures.wait()
-        reward_futures.wait()
-        actor_rollout_futures.wait()
-        rollout_futures.wait()
+        actor_rollout_handle.wait()
+        actor_reward_handle.wait()
+        rollout_handle.wait()
+        reward_handle.wait()
 
+    # def generate_rollouts(self):
+    #     env_futures = self.env.interact()
+    #     reward_futures = self.reward.predict_rewards()
+    #     rollout_futures = self.rollout.generate()
+    #     actor_futures = self.actor.recv_rollout_batch()
+    #     env_results = env_futures.wait()
+    #     reward_futures.wait()
+    #     actor_futures.wait()
+    #     rollout_futures.wait()
 
-    def generate_rollouts(self):
-        env_futures = self.env.interact()
-        reward_futures = self.reward.predict_rewards()
-        rollout_futures = self.rollout.generate()
-        actor_futures = self.actor.recv_rollout_batch()
-        env_results = env_futures.wait()
-        reward_futures.wait()
-        actor_futures.wait()
-        rollout_futures.wait()
-
-        env_results_list = [results for results in env_results if results is not None]
-        env_metrics = compute_evaluate_metrics(env_results_list)
+    #     env_results_list = [results for results in env_results if results is not None]
+    #     env_metrics = compute_evaluate_metrics(env_results_list)
         
-        return env_metrics
+    #     return env_metrics
 
     def evaluate(self):
-        env_futures = self.env.evaluate()
-        rollout_futures = self.rollout.evaluate()
-        env_results = env_futures.wait()
-        rollout_futures.wait()
+        env_handle: Handle = self.env.evaluate(
+            input_channel=self.rollout_channel,
+            output_channel=self.env_channel,
+        )
+        rollout_handle: Handle = self.rollout.evaluate(
+            input_channel=self.env_channel,
+            output_channel=self.rollout_channel,
+        )
+        env_results = env_handle.wait()
+        rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
+
 
     def run(self):
         start_step = self.global_step
@@ -360,19 +371,38 @@ class IRLEmbodiedRunner:
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
-                    self.update_rollout_weights()
+                    self.update_weights()
                 with self.timer("generate_rollouts"):
-                    env_metrics = self.generate_rollouts()
+                    env_handle: Handle = self.env.interact(
+                        input_channel=self.rollout_channel,
+                        output_channel=self.env_channel,
+                    )
+                    reward_handle: Handle = self.reward.predict_rewards(
+                        input_channel=self.env_channel,
+                        output_channel=self.reward_channel,
+                    )
+                    rollout_handle: Handle = self.rollout.generate(
+                        env_input_channel=self.env_channel,
+                        reward_input_channel=self.reward_channel,
+                        output_channel=self.rollout_channel,
+                        actor_channel=self.actor_channel,
+                    )
+                    self.actor.recv_rollout_batch(
+                        input_channel=self.actor_channel
+                    ).wait()
+                    reward_handle.wait()
+                    rollout_handle.wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
-                    actor_futures = self.actor.compute_advantages_and_returns()
-                    actor_rollout_metrics = actor_futures.wait()
+                    actor_rollout_metrics = (
+                        self.actor.compute_advantages_and_returns().wait()
+                    )
 
-                # actor， critic and discriminator training.
+                # actor training.
                 with self.timer("actor_training"):
-                    actor_training_futures = self.actor.run_training()
-                    actor_training_metrics = actor_training_futures.wait()
+                    actor_training_metrics = self.actor.run_training().wait()
+
 
                 self.global_step += 1
 
@@ -385,20 +415,34 @@ class IRLEmbodiedRunner:
                     run_time_exceeded=False,
                 )
 
+                eval_metrics = {}
+                if run_val:
+                    with self.timer("eval"):
+                        self.update_rollout_weights()
+                        eval_metrics = self.evaluate()
+                        eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                        self.metric_logger.log(data=eval_metrics, step=_step)
+
                 if save_model:
                     self._save_checkpoint()
 
             time_metrics = self.timer.consume_durations()
-
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+
+            env_results_list = [
+                results for results in env_handle.wait() if results is not None
+            ]
+            env_metrics = compute_evaluate_metrics(env_results_list)
+            env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+
             rollout_metrics = {
                 f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
             }
-            env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
-            time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+
             training_metrics = {
                 f"train/{k}": v for k, v in actor_training_metrics[0].items()
             }
+     
             self.metric_logger.log(env_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
@@ -435,4 +479,3 @@ class IRLEmbodiedRunner:
     @property
     def epoch(self):
         return self.global_step // self.num_steps_per_epoch
-

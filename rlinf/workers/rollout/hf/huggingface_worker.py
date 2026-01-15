@@ -29,6 +29,7 @@ from rlinf.utils.nested_dict_process import put_tensor_device
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.rollout.hf.utils import init_real_obs
 from rlinf.data.io_struct import ActionOutput
+
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -372,8 +373,7 @@ class MultiStepRolloutWorker(Worker):
 class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        self._obs_rollout_queue_name = cfg.env.channel.queue_name_rollout
-        self._reward_queue_name = cfg.reward.channel.queue_name
+
 
     def predict(self, env_obs, mode="train"):
         kwargs = (
@@ -384,12 +384,15 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.OPENPI,
-            SupportedModel.IRLOPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
+            SupportedModel.CNN_POLICY,
+            SupportedModel.IRLOPENPI
         ]:
             kwargs = {"mode": mode}
-        
+
+        kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
+
         with torch.no_grad():
             actions, result = self.hf_model.predict_action_batch(
                 env_obs=env_obs,
@@ -416,7 +419,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
 
     #     return env_output
 
-    def generate(self):
+    async def generate(self, env_input_channel: Channel, reward_input_channel: Channel, output_channel: Channel, actor_channel: Channel):
         if self.enable_offload:
             self.reload_model()
 
@@ -435,12 +438,15 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
+            
             for i in range(n_chunk_steps):
                 for stage_id in range(self.num_pipeline_stages):
-                    env_output = self.recv_env_output()
-                    actions, result = self.predict(env_output["obs"])
-                    reward_output = self.recv_reward()
-            
+                    env_output = await self.recv_env_output(env_input_channel)
+                
+                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    actions, result = self.predict(extracted_obs)
+                    reward_output = await self.recv_reward(reward_input_channel)
+
                     normalized_actions = result["normalized_actions"]
                     result["forward_inputs"].update(
                         {"normalized_actions": normalized_actions}
@@ -456,25 +462,34 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                         prev_values=result["prev_values"],
                         dones=reward_output["dones"],
                         rewards=reward_output["rewards"],  # the first step is reset step, reward is none, which will not be appended to the buffer
+                        truncations=env_output["truncations"],
+                        terminations=env_output["terminations"],
                         forward_inputs=result["forward_inputs"],
                     )
                    
                     self.buffer_list[stage_id].append_result(chunk_step_result)
+
                     action_output = ActionOutput(actions=actions, normalized_actions=normalized_actions)
-                    self.send_chunk_actions(action_output.to_dict())
+                    self.send_chunk_actions(output_channel, action_output.to_dict())
 
 
             ### receive reward add last image
             for stage_id in range(self.num_pipeline_stages):
                 # Get dones and rewards from reward worker (final step of epoch)
-                reward_output = self.recv_reward()
+                reward_output = await self.recv_reward(reward_input_channel)
                 self.buffer_list[stage_id].dones.append(reward_output['dones'])
                 self.buffer_list[stage_id].rewards.append(reward_output['rewards'])
 
-                env_output = self.recv_env_output()
+                env_output = await self.recv_env_output(env_input_channel)
+                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+
                 with self.worker_timer():
-                    actions, result = self.predict(env_output["obs"])
-                
+                    actions, result = self.predict(extracted_obs)
+                self.buffer_list[stage_id].truncations.append(env_output["truncations"])
+                self.buffer_list[stage_id].terminations.append(
+                    env_output["terminations"]
+                )
+        
                 if self.cfg.reward.use_next_image:
                     self.buffer_list[stage_id].forward_inputs.append(
                             {"observation/next_image": result["forward_inputs"]["observation/image"].clone()}
@@ -485,22 +500,31 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                     self.buffer_list[stage_id].prev_values.append(
                         result["prev_values"].cpu().contiguous()
                     )
-                
-
+            
+            
         for i in range(self.num_pipeline_stages):
-            self.send_rollout_batch(i)
-
+            self.send_rollout_batch(actor_channel, i)
+            
         if self.enable_offload:
             self.offload_model()
 
-    def recv_env_output(self):
-        env_output = self.channel.get(
-            key=f"{self._obs_rollout_queue_name}_{self._rank}",
-        )
+    async def recv_reward(
+        self, input_channel: Channel, mode="train"
+    ) -> dict[str, torch.Tensor]:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        # Use asyncio so that it can run alongside async weight syncing
+        reward = await input_channel.get(
+            key=f"{self._rank}_{mode}", async_op=True
+        ).async_wait()
+        
+        return reward
+
+    async def recv_env_output(
+        self, input_channel: Channel, mode="train"
+    ) -> dict[str, torch.Tensor]:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        # Use asyncio so that it can run alongside async weight syncing
+        env_output = await input_channel.get(
+            key=f"{self._rank}_{mode}_rollout", async_op=True
+        ).async_wait()
         return env_output
-    
-    def recv_reward(self):
-        return self.channel.get(
-            key=f"{self._reward_queue_name}_{self._rank}",
-        )
-    

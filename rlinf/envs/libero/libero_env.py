@@ -494,6 +494,7 @@ class LiberoEnv(gym.Env):
         self.render_images = []
 
 
+### Not used currently
 class IRLLiberoEnv(LiberoEnv):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
         super().__init__(cfg, num_envs, seed_offset, total_num_processes)

@@ -19,9 +19,9 @@ from omegaconf import DictConfig, open_dict
 
 from rlinf.data.io_struct import RewardOutput
 from rlinf.config import SupportedModel
-from rlinf.models import get_model, get_vla_model_config_and_processor
-from rlinf.scheduler import Worker
-
+from rlinf.models import get_model
+from rlinf.scheduler import Channel, Worker, Cluster
+from rlinf.utils.placement import HybridComponentPlacement
 
 class IRLRewardWorker(Worker):
     def __init__(self, cfg: DictConfig):
@@ -29,11 +29,13 @@ class IRLRewardWorker(Worker):
         self.cfg = cfg
         self.actor_group_name = cfg.actor.group_name
         self.device = torch.cuda.current_device()
-        self._obs_reward_queue_name = cfg.env.channel.queue_name_reward
-        self._reward_queue_name = cfg.reward.channel.queue_name
-        self.channel = self.connect_channel(cfg.rollout.channel.name)
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
+
+        self.placement = HybridComponentPlacement(cfg, Cluster())
+
+        reward_world_size = self.placement.get_world_size("reward")
+        self.reward_weight_src_rank = self._rank % reward_world_size
 
     def init_worker(self):
         reward_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -43,19 +45,22 @@ class IRLRewardWorker(Worker):
 
         self.hf_model = get_model(reward_model_config)
         
-        ### only support OpenPI
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.OPENVLA,
-            SupportedModel.OPENVLA_OFT,
-        ]:
-            model_config, input_processor = get_vla_model_config_and_processor(
-                self.cfg.actor
-            )
-            self.hf_model.setup_config_and_processor(
-                model_config, self.cfg, input_processor
-            )
+        if self.cfg.runner.get("ckpt_path", None):
+            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            self.hf_model.load_state_dict(model_dict)
 
         self.hf_model.eval()
+
+        if self.enable_offload:
+            self.offload_model()
+
+    def offload_model(self):
+        self.hf_model = self.hf_model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def reload_model(self):
+        self.hf_model = self.hf_model.to(self.device)
 
     def get_dones_and_rewards(
         self,
@@ -108,7 +113,10 @@ class IRLRewardWorker(Worker):
         with torch.no_grad():
             return predict_fn(env_output)
         
-    def predict_rewards(self):
+    async def predict_rewards(self, input_channel: Channel, output_channel: Channel):
+        if self.enable_offload:
+            self.reload_model()
+
         n_chunk_steps = (
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
@@ -116,43 +124,52 @@ class IRLRewardWorker(Worker):
         for _ in range(self.cfg.algorithm.rollout_epoch):
             for _ in range(n_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
-                    env_output = self.recv_env_output()
+                    env_output = await self.recv_env_output(input_channel)
                     if (
-                        "next_obs" in env_output
-                        and "normalized_actions" in env_output
+                        "normalized_actions" in env_output
+                        # "next_obs" in env_output
+                        # and "normalized_actions" in env_output
                     ):
                         assert env_output['rewards'] is not None, "Rewards must be in the env_output"
-                        # pred_rewards, processed_last_image = self._predict_rewards(env_output)
-                        # dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
-                        # reward_output = RewardOutput(rewards=rewards, dones=dones, last_obs=processed_last_image)
+                        ### Maybe add extracted_obs
                         pred_rewards = self._predict_rewards(env_output)
                         dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
                         reward_output = RewardOutput(rewards=rewards, dones=dones)
                     else:
                         reward_output = RewardOutput(rewards=None, dones=env_output['dones'].bool().cpu().contiguous())
-                    self.send_reward(reward_output.to_dict())
+                    self.send_reward(output_channel, reward_output.to_dict())
 
             for _ in range(self.num_pipeline_stages):
                 assert "normalized_actions" in env_output and env_output['rewards'] is not None, "env_output structure is not correct"
-                env_output = self.recv_env_output()
+                env_output =  await self.recv_env_output(input_channel)
                 pred_rewards = self._predict_rewards(env_output)
                 dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
                 reward_output = RewardOutput(rewards=rewards, dones=dones)
-                self.send_reward(reward_output.to_dict())
+                self.send_reward(output_channel, reward_output.to_dict())
 
-    def send_reward(self, rewards: dict[str, torch.Tensor]):
-        self.channel.put(
+    def send_reward(self, output_channel: Channel, rewards: dict[str, torch.Tensor], mode="train"):
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        output_channel.put(
             item=rewards,
-            key=f"{self._reward_queue_name}_{self._rank}",
+            key=f"{self._rank}_{mode}", async_op=True
         )
 
-    def recv_env_output(self):
-        return self.channel.get(
-            key=f"{self._obs_reward_queue_name}_{self._rank}",
-        )
-    
-    def sync_model_from_actor(self):
-        param_state_dict = self.recv(self.actor_group_name, src_rank=self._rank)
+    async def recv_env_output(
+        self, input_channel: Channel, mode="train"
+    ) -> dict[str, torch.Tensor]:
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        # Use asyncio so that it can run alongside async weight syncing
+        env_output = await input_channel.get(
+            key=f"{self._rank}_{mode}_reward", async_op=True
+        ).async_wait()
+        return env_output
+
+    async def sync_model_from_actor(self):
+        """Sync model parameters from the actor worker."""
+        param_state_dict = await self.recv(
+            self.actor_group_name, src_rank=self.reward_weight_src_rank, async_op=True
+        ).async_wait()
+
         self.hf_model.load_state_dict(param_state_dict)
         del param_state_dict
         gc.collect()
