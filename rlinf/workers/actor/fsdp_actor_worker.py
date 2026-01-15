@@ -1454,7 +1454,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                     with backward_ctx:
                         self.grad_scaler.scale(disc_loss).backward()
 
-                    disc_metrics_data["disc_loss"] = disc_loss.detach().item()
+                    disc_metrics_data["discriminator/total_loss"] = disc_loss.detach().item()
                     append_to_dict(metrics, disc_metrics_data)
 
                 torch.cuda.empty_cache()
