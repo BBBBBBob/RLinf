@@ -29,7 +29,7 @@ runner:
   save_interval: 2000
 
 data:
-  data_path: "/path/to/libero-data"
+  data_path: "/home/j84403411/RLinf/data"
 
 algorithm:
   adv_type: gae
@@ -38,13 +38,14 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 4
-  global_batch_size: 128
+  global_batch_size: 4
   seed: 0
 
   # Override the default values in model/pi0
   model:
     precision: null
-    model_path: "/path/to/pi0-model"
+    # model_path: "/path/to/pi0-model"
+    model_path: 
     num_action_chunks: 4 # interface for the env
     add_value_head: True
     openpi:

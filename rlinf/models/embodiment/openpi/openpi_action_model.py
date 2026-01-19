@@ -772,8 +772,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if not self.use_vlm_value:
                 chains_values.append(value_t)
 
-        if self.use_vlm_value:
-            chains_values.append(self.get_value_from_vlm(prefix_output))
+        # if self.use_vlm_value:
+        #     chains_values.append(self.get_value_from_vlm(prefix_output))
             
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
@@ -972,7 +972,6 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
         actions = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"].numpy()
-
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
@@ -981,11 +980,13 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
         }
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
+        normalized_actions = outputs["actions"].detach().cpu().contiguous() 
+        normalized_actions[:, :, 7:] = torch.zeros_like(normalized_actions[:, :, 7:])
         result = {
             "prev_logprobs": outputs["prev_logprobs"],
             "prev_values": outputs["prev_values"],
             "forward_inputs": forward_inputs,
-            "normalized_actions": outputs["actions"].detach().cpu().contiguous()
+            "normalized_actions": normalized_actions,
         }
         return actions, result
     
@@ -995,7 +996,6 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
         head_name: str = "actor_critic",
         **kwargs,
     ) -> dict[str, Any]:
-        # get kwargs
         if head_name == "actor_critic":
             compute_values = kwargs.get("compute_values", False)
             chains = data["chains"]
@@ -1035,17 +1035,27 @@ class OpenPi0ForRLActionRewardPrediction(OpenPi0ForRLActionPrediction):
                 :, None
             ]  # [:,None] to align with loss-mask shape
             value_t = value_t.mean(dim=-1, keepdim=False)
+
             return {
                 "logprobs": log_probs,
                 "values": value_t,
                 "entropy": entropy,
             }
+        
         elif head_name == "discriminator":
             ## If the data comes from the policy
-            observation = self.input_transform(data, transpose=False)
-            observation = self.precision_processor(observation)
-            observation = _model.Observation.from_dict(observation)
+            data_type = kwargs.get("data_type", None)
+            
+            if data_type == "policy":
+                observation = self.input_transform(data, transpose=False)
+                observation = self.precision_processor(observation)
+                observation = _model.Observation.from_dict(observation)
 
+            elif data_type == "expert": 
+                observation = data["observation"]
+
+            else:
+                raise ValueError(f"Invalid data_type: {data_type}")
             state = observation.state
             device = state.device
             t_input = torch.zeros((state.shape[0],), device=device)

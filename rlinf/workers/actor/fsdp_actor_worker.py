@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import time
 import os
 from functools import partial
 
 import numpy as np
 import torch
+import jax
 from omegaconf import DictConfig
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -65,6 +66,10 @@ from rlinf.utils.utils import (
     retrieve_model_state_dict_in_cpu,
 )
 from rlinf.workers.rollout.utils import RankMapper
+from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+import openpi.training.data_loader as openpi_data_loader
+
 
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
@@ -1118,10 +1123,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        ### TODO add dataloader for expert demonstrations
         self._reward_group_name = cfg.reward.group_name
         self.disc_enable_offload = self.cfg.reward.get("enable_offload", False)
-
+        self.data_loader = self.build_dataloader()
+        self.data_iter = iter(self.data_loader)
+    
     def _setup_reward_weight_dst_ranks(self) -> None:
         reward_world_size = self._component_placement.get_world_size("reward")
         actor_world_size = self._world_size
@@ -1195,6 +1201,18 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         if self.enable_offload and self.disc_enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
+    def build_dataloader(self):
+        config = get_openpi_config(
+            self.cfg.actor.model.openpi.config_name,
+            model_path=self.cfg.actor.model.model_path,
+            batch_size=self.cfg.reward.micro_batch_size
+        )
+        data_loader = openpi_data_loader.create_data_loader(
+            config, framework="pytorch", shuffle=True
+        )
+        return data_loader
+    
+        
     def run_training(self):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -1258,7 +1276,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-
         for _ in range(update_epoch):
             rollout_dataloader_iter = get_iterator_k_split(
                 actor_critic_batch,
@@ -1388,7 +1405,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         clear_memory()
 
         ### training discriminator
-        ### TODO We should align the batch size first then convert into the whole batch size for reward prediction, change the batch size if needed
         irl_update_epoch = self.cfg.algorithm.get("irl_update_epoch", 1)
         for _ in range(irl_update_epoch):
             rollout_dataloader_iter = get_iterator_k_split(
@@ -1414,28 +1430,48 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                 self.discriminator_optimizer.zero_grad()
                 for idx, data in enumerate(train_micro_batch):
-                    data = put_tensor_device(
+                    policy_data = put_tensor_device(
                         data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
                     )
+                    
+                    observation, actions = next(self.data_iter)
+                    observation = jax.tree.map(
+                        lambda x: torch.as_tensor(x, device=f"cuda:{int(os.environ['LOCAL_RANK'])}")
+                        .contiguous()
+                        .clone(),
+                        observation,
+                    )
+                    actions = actions.to(device=f"cuda:{int(os.environ['LOCAL_RANK'])}", dtype=torch.float32)
+                    expert_data = {
+                        "observation": observation,
+                        "normalized_actions": actions,
+                    } 
+                    assert policy_data["normalized_actions"].shape[0] == expert_data["normalized_actions"].shape[0], "batch size of policy and expert should be the same"
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.disc_gradient_accumulation,
                     )
 
                     with self.amp_context:
-                        disc_output = self.model(
-                            data=data,
+                        policy_disc_output = self.model(
+                            data=policy_data,
                             head_name="discriminator",
-                            resource="policy" 
+                            data_type="policy" 
                         )
-                    policy_target = torch.zeros(disc_output.shape, device=disc_output.device)
+                        expert_disc_output = self.model(
+                            data=expert_data,
+                            head_name="discriminator",
+                            data_type="expert" 
+                        )
+                    policy_target = torch.zeros_like(policy_disc_output)
+                    expert_target = torch.ones_like(expert_disc_output)
                     kwargs = {
                         "loss_type": self.cfg.algorithm.irl_loss_type,
                         "task_type": self.cfg.runner.task_type,
-                        "policy_input": disc_output,
+                        "policy_input": policy_disc_output,
                         "policy_target": policy_target,
-                        "expert_input": disc_output,  # dummy input
-                        "expert_target": policy_target,  # dummy target
+                        "expert_input": expert_disc_output, 
+                        "expert_target": expert_target, 
                     }
                     disc_loss, disc_metrics_data = policy_loss(**kwargs)
 
@@ -1443,8 +1479,8 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                         entropy_kwargs = {
                         "loss_type": self.cfg.algorithm.irl_loss_type + "_entropy",
                         "task_type": self.cfg.runner.task_type,
-                        "policy_input": disc_output,
-                        "expert_input": disc_output,  # dummy input
+                        "policy_input": policy_disc_output,
+                        "expert_input": expert_disc_output,  # dummy input
                         }
                         disc_entropy_loss, disc_entropy_metrics_data = policy_loss(**entropy_kwargs)
                         disc_metrics_data.update(disc_entropy_metrics_data)
@@ -1469,6 +1505,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.discriminator_lr_scheduler.step()
         self.discriminator_optimizer.zero_grad()
         clear_memory()
+        
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
