@@ -1,14 +1,14 @@
 defaults:
-  - model/pi0@actor.model
-  - training_backend/fsdp@actor.fsdp_config
-  - override hydra/job_logging: stdout
+- model/pi0@actor.model
+- training_backend/fsdp@actor.fsdp_config
+- override hydra/job_logging: stdout
 
 hydra:
   run:
     dir: .
   output_subdir: null
   searchpath:
-    - file://${oc.env:EMBODIED_PATH}/config/
+  - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
   num_nodes: 1
@@ -21,7 +21,7 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "test_openpi"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: [ "tensorboard" ] # wandb, swanlab
 
   max_epochs: 30000
   max_steps: -1
@@ -52,21 +52,21 @@ actor:
       detach_critic_input: True
 
   optim:
-    lr: 2.5e-5  
+    lr: 2.5e-5
     value_lr: 1.55e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
-    adam_eps: 1.0e-08  
-    weight_decay: 1.0e-10  
+    adam_eps: 1e-8
+    weight_decay: 1e-10
     clip_grad: 1.0
-    warmup_style: "cosine"  
-    lr_warmup_steps: 1000  
-    total_training_steps: 30000  # for lr scheduler cosine decay
+    warmup_style: "cosine"
+    lr_warmup_steps: 1000
+    total_training_steps: 30000 # for lr scheduler cosine decay
 
   # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
+    sharding_strategy: "full_shard"
     use_orig_params: False
     gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
     mixed_precision:
