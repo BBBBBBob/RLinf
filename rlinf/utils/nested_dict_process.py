@@ -69,7 +69,7 @@ def concat_batch(data1, data2):
             batch[key] = concat_batch(data1[key], data2[key])
     return batch
 
-
+### todo for chunk_observations, the input contains list
 def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
     if len(list_of_dict) == 0:
         return {}

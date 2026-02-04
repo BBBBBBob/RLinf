@@ -25,6 +25,9 @@ from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     Trajectory,
+    IRLChunkStepResult,
+    IRLEmbodiedRolloutResult,
+    IRLTrajectory,
 )
 from rlinf.models import get_model
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
@@ -423,6 +426,14 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
 
         return actions, result
     
+    async def send_rollout_trajectories(
+        self, rollout_result: IRLEmbodiedRolloutResult, channel: Channel
+    ):
+        split_num = self.get_actor_split_num()
+        trajectories: IRLTrajectory = rollout_result.to_splited_trajectories(split_num)
+        for trajectory in trajectories:
+            channel.put(trajectory, async_op=True)
+    
     # def preprocess_chunk_observations(self, env_output: dict[str, torch.Tensor]):
     #     chunk_obs = env_output.get("chunk_observations")
     #     if chunk_obs is None:
@@ -440,13 +451,16 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
     #     env_output["chunk_observations"] = processed_obs
 
     #     return env_output
-
+    
     async def generate(self, env_input_channel: Channel, reward_input_channel: Channel, output_channel: Channel, actor_channel: Channel):
         if self.enable_offload:
             self.reload_model()
 
-        self.buffer_list = [
-            EmbodiedRolloutResult(rollout_epoch=self.cfg.algorithm.rollout_epoch)
+        self.rollout_results: list[IRLEmbodiedRolloutResult] = [
+            IRLEmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+                model_weights_id=self.model_weights_id,
+            )
             for _ in range(self.num_pipeline_stages)
         ]
 
@@ -454,7 +468,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
         )
-    
+        ### todo add chunk_obersavations here, also need to add the last step observation
         for _ in tqdm(
             range(self.cfg.algorithm.rollout_epoch),
             desc="Generating Rollout Epochs",
@@ -470,16 +484,14 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                     reward_output = await self.recv_reward(reward_input_channel)
 
                     normalized_actions = result["normalized_actions"]
-                    result["forward_inputs"].update(
-                        {"normalized_actions": normalized_actions}
-                    )
-                    
-                    if self.cfg.reward.use_next_image:
-                        if i > 0:
-                            result["forward_inputs"].update(
-                            {"observation/next_image": result["forward_inputs"]["observation/image"].clone()}
-                        )
-                    chunk_step_result = ChunkStepResult(
+                    # result["forward_inputs"].update(
+                    #     {"normalized_actions": normalized_actions}
+                    # )
+                    # if "chunk_observations" in env_output.keys():
+                    #     result["forward_inputs"].update({"chunk_observations": env_output["chunk_observations"]})
+                  
+                    chunk_step_result = IRLChunkStepResult(
+                        normalized_actions=normalized_actions,
                         prev_logprobs=result["prev_logprobs"],
                         prev_values=result["prev_values"],
                         dones=reward_output["dones"],
@@ -487,9 +499,10 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                         truncations=env_output["truncations"],
                         terminations=env_output["terminations"],
                         forward_inputs=result["forward_inputs"],
+                        chunk_observations=env_output["chunk_observations"] if "chunk_observations" in env_output.keys() else None ### chunk_observations is one step behind normalized_actions
                     )
                    
-                    self.buffer_list[stage_id].append_result(chunk_step_result)
+                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
 
                     action_output = ActionOutput(actions=actions, normalized_actions=normalized_actions)
                     self.send_chunk_actions(output_channel, action_output.to_dict())
@@ -499,33 +512,33 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
             for stage_id in range(self.num_pipeline_stages):
                 # Get dones and rewards from reward worker (final step of epoch)
                 reward_output = await self.recv_reward(reward_input_channel)
-                self.buffer_list[stage_id].dones.append(reward_output['dones'])
-                self.buffer_list[stage_id].rewards.append(reward_output['rewards'])
-
                 env_output = await self.recv_env_output(env_input_channel)
                 extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-
+                ### TODO add chunk_obs and extracted_obs here to forward_inputs
                 with self.worker_timer():
                     actions, result = self.predict(extracted_obs)
-                self.buffer_list[stage_id].truncations.append(env_output["truncations"])
-                self.buffer_list[stage_id].terminations.append(
-                    env_output["terminations"]
-                )
-        
-                if self.cfg.reward.use_next_image:
-                    self.buffer_list[stage_id].forward_inputs.append(
-                            {"observation/next_image": result["forward_inputs"]["observation/image"].clone()}
-                        )
-                # For the final step, we only need prev_values for bootstrapping
-                # This is a special case that doesn't create a full ChunkStepResult
-                if "prev_values" in result:
-                    self.buffer_list[stage_id].prev_values.append(
-                        result["prev_values"].cpu().contiguous()
-                    )
+
+                 ### TODO add normalized actions from results here to forward_inputs
+                chunk_step_result = IRLChunkStepResult(
+                dones=reward_output['dones'],
+                rewards=reward_output['rewards'],
+                truncations=env_output["truncations"],
+                terminations=env_output["terminations"],
+                prev_logprobs=None,
+                prev_values=result["prev_values"]
+                if self.cfg.rollout.get("collect_prev_infos", True)
+                else None,
+                forward_inputs=None,
+                chunk_observations=env_output["chunk_observations"]
+            )
+
+                self.rollout_results[stage_id].append_step_result(chunk_step_result)
             
             
-        for i in range(self.num_pipeline_stages):
-            self.send_rollout_batch(actor_channel, i)
+        for stage_id in range(self.num_pipeline_stages):
+            await self.send_rollout_trajectories(
+                self.rollout_results[stage_id], actor_channel
+            )
             
         if self.enable_offload:
             self.offload_model()

@@ -503,6 +503,10 @@ class IRLLiberoEnv(LiberoEnv):
          # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         chunk_observations = {}
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
         for key, value in last_extracted_obs.items():
             if key != "task_descriptions":
                 chunk_observations[key] = torch.empty(
@@ -514,13 +518,8 @@ class IRLLiberoEnv(LiberoEnv):
         chunk_observations["task_descriptions"] = list(
             last_extracted_obs["task_descriptions"]
         )
-        chunk_rewards = []
-        raw_chunk_terminations = []
-        raw_chunk_truncations = []
-
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
-            ### TODO check reward in the step function  
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )

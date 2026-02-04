@@ -469,12 +469,12 @@ class IRLEnvWorker(EnvWorker):
         ### Only for LIBERO-IRL, observation chunk is not correct
         ### IRL takes current observation and action pair
         ### This is for the each step and action pairs
-        # extracted_obs, chunk_observations, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
-        #     self.simulator_list[stage_id].chunk_step(chunk_actions, last_extracted_obs)
-        # )
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+        extracted_obs, chunk_observations, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+            self.simulator_list[stage_id].chunk_step(chunk_actions, last_extracted_obs)
         )
+        # extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+        #     self.env_list[stage_id].chunk_step(chunk_actions)
+        # )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if not self.cfg.env.train.auto_reset:
@@ -513,13 +513,13 @@ class IRLEnvWorker(EnvWorker):
 
         reward_env_output = RewardEnvOutput(
             obs=last_extracted_obs,
+            normalized_actions=chunk_normalized_actions,
+            chunk_observations=chunk_observations,
             final_obs=infos["final_observation"]
             if "final_observation" in infos
             else None,
             rewards=chunk_rewards,
             dones=chunk_dones,
-            normalized_actions=chunk_normalized_actions,
-            next_obs=extracted_obs['main_images'] if self.cfg.reward.use_next_image else None,
         )
 
         return rollout_env_output, reward_env_output, env_info

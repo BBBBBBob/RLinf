@@ -140,6 +140,20 @@ class ChunkStepResult:
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
 
+### todo rewrite IRLChunkStepResult I want to inheritate from ChunkStepResult
+@dataclass(kw_only=True)
+class IRLChunkStepResult(ChunkStepResult):
+    """Chunk step outputs with additional IRL-specific fields."""
+
+    normalized_actions: torch.Tensor = None  # [B, len, action_dim]
+    chunk_observations: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.normalized_actions is not None:
+            self.normalized_actions = self.normalized_actions.cpu().contiguous()
+        if self.chunk_observations:
+            self.chunk_observations = put_tensor_device(self.chunk_observations, "cpu")
+        super().__post_init__()
 
 @dataclass
 class Trajectory:
@@ -163,6 +177,15 @@ class Trajectory:
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class IRLTrajectory(Trajectory):
+    """
+    trajectory contains multiple episodes.
+    """
+
+    normalized_actions: torch.Tensor = None
+    chunk_observations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -333,6 +356,160 @@ class EmbodiedRolloutResult:
         return splited_trajectories
 
 
+@dataclass(kw_only=True)
+class IRLEmbodiedRolloutResult(EmbodiedRolloutResult):
+    """
+    Collect chunk-step results and transitions during rollout,
+    and convert them into trajectory tensors.
+    """
+
+    normalized_actions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    chunk_observations: list[dict[str, Any]] = field(
+        default_factory=list
+    )  # trajectory_length
+
+    def append_step_result(self, result: IRLChunkStepResult):
+        if result.actions is not None:
+            self.actions.append(result.actions)
+            self.intervene_flags.append(torch.zeros(1, dtype=torch.bool))
+        if result.normalized_actions is not None:
+            self.normalized_actions.append(result.normalized_actions)
+        if result.rewards is not None:
+            self.rewards.append(result.rewards)
+        if result.terminations is not None:
+            self.terminations.append(result.terminations)
+        if result.truncations is not None:
+            self.truncations.append(result.truncations)
+        if result.dones is not None:
+            self.dones.append(result.dones)
+        if result.prev_logprobs is not None:
+            self.prev_logprobs.append(result.prev_logprobs)
+        if result.prev_values is not None:
+            self.prev_values.append(result.prev_values)
+        if result.forward_inputs is not None:
+            self.forward_inputs.append(result.forward_inputs)
+        if result.chunk_observations is not None:
+            self.chunk_observations.append(result.chunk_observations)
+
+    def to_trajectory(self) -> IRLTrajectory:
+        # return [trajectory_length, B, ...]
+        trajectory = IRLTrajectory(
+            max_episode_length=self.max_episode_length,
+            model_weights_id=self.model_weights_id,
+        )
+        if len(self.actions) > 0:
+            trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
+        if len(self.intervene_flags) > 0:
+            trajectory.intervene_flags = (
+                torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
+            )
+        if len(self.normalized_actions) > 0:
+            trajectory.normalized_actions = torch.stack(self.normalized_actions, dim=0).cpu().contiguous()
+        if len(self.rewards) > 0:
+            trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
+        if len(self.terminations) > 0:
+            trajectory.terminations = (
+                torch.stack(self.terminations, dim=0).cpu().contiguous()
+            )
+        if len(self.truncations) > 0:
+            trajectory.truncations = (
+                torch.stack(self.truncations, dim=0).cpu().contiguous()
+            )
+        if len(self.dones) > 0:
+            trajectory.dones = torch.stack(self.dones, dim=0).cpu().contiguous()
+        if len(self.prev_logprobs) > 0:
+            trajectory.prev_logprobs = (
+                torch.stack(self.prev_logprobs, dim=0).cpu().contiguous()
+            )
+        if len(self.prev_values) > 0:
+            trajectory.prev_values = (
+                torch.stack(self.prev_values, dim=0).cpu().contiguous()
+            )
+        if len(self.forward_inputs) > 0:
+            trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
+            for key in trajectory.forward_inputs.keys():
+                trajectory.forward_inputs[key] = (
+                    trajectory.forward_inputs[key].cpu().contiguous()
+                )
+        if len(self.chunk_observations) > 0:
+            trajectory.chunk_observations = stack_list_of_dict_tensor(self.chunk_observations)
+            for key in trajectory.chunk_observations.keys():
+                trajectory.chunk_observations[key] = (
+                    trajectory.chunk_observations[key].cpu().contiguous()
+                )
+
+        if len(self.curr_obs) > 0:
+            trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
+            for key in trajectory.curr_obs.keys():
+                trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
+        if len(self.next_obs) > 0:
+            trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
+            for key in trajectory.next_obs.keys():
+                trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+        return trajectory
+
+    def to_splited_trajectories(self, split_size: int) -> list[IRLTrajectory]:
+        all_trajectory: IRLTrajectory = self.to_trajectory()
+        splited_trajectories: list[IRLTrajectory] = [
+            IRLTrajectory() for _ in range(split_size)
+        ]
+
+        if len(all_trajectory.curr_obs) > 0:
+            splited_obs = split_dict_to_chunk(
+                all_trajectory.curr_obs, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].curr_obs = splited_obs[i]
+        if len(all_trajectory.next_obs) > 0:
+            splited_obs = split_dict_to_chunk(
+                all_trajectory.next_obs, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].next_obs = splited_obs[i]
+
+        if (
+            all_trajectory.forward_inputs is not None
+            and len(all_trajectory.forward_inputs) > 0
+        ):
+            splited_forward_inputs = split_dict_to_chunk(
+                all_trajectory.forward_inputs, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
+        
+        if (
+            all_trajectory.chunk_observations is not None
+            and len(all_trajectory.chunk_observations) > 0
+        ):
+            splited_chunk_observations = split_dict_to_chunk(
+                all_trajectory.chunk_observations, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].chunk_observations = splited_chunk_observations[i]
+
+
+        for field_name in all_trajectory.__dataclass_fields__.keys():
+            value = getattr(all_trajectory, field_name)
+
+            if value is None or isinstance(value, dict):
+                continue
+
+            if isinstance(value, int) or isinstance(value, str):
+                for i in range(split_size):
+                    setattr(splited_trajectories[i], field_name, value)
+                continue
+            elif isinstance(value, torch.Tensor):
+                chunks = torch.chunk(value, split_size, dim=1)
+                for i in range(split_size):
+                    setattr(splited_trajectories[i], field_name, chunks[i])
+            else:
+                raise ValueError(
+                    f"Unsupported value type: {type(value)} for field_name: {field_name}"
+                )
+
+        return splited_trajectories
+    
+
 def convert_trajectories_to_batch(
     trajectories: list[Trajectory],
 ) -> dict[str, torch.Tensor]:
@@ -397,89 +574,6 @@ def convert_trajectories_to_batch(
 
     return batch
 
-
-@dataclass(kw_only=True)
-class EnvOutput:
-    obs: dict[str, Any]
-    final_obs: Optional[dict[str, Any]] = None
-    dones: Optional[torch.Tensor] = None  # [B]
-    terminations: Optional[torch.Tensor] = None  # [B]
-    truncations: Optional[torch.Tensor] = None  # [B]
-    rewards: Optional[torch.Tensor] = None  # [B]
-
-    intervene_actions: Optional[torch.Tensor] = None  # [B]
-    intervene_flags: Optional[torch.Tensor] = None  # [B]
-
-    def __post_init__(self):
-        self.obs = put_tensor_device(self.obs, "cpu")
-        self.final_obs = (
-            put_tensor_device(self.final_obs, "cpu")
-            if self.final_obs is not None
-            else None
-        )
-        self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
-        self.terminations = (
-            self.terminations.cpu().contiguous()
-            if self.terminations is not None
-            else None
-        )
-        self.truncations = (
-            self.truncations.cpu().contiguous()
-            if self.truncations is not None
-            else None
-        )
-        self.rewards = (
-            self.rewards.cpu().contiguous() if self.rewards is not None else None
-        )
-        self.intervene_actions = (
-            self.intervene_actions.cpu().contiguous()
-            if self.intervene_actions is not None
-            else None
-        )
-        self.intervene_flags = (
-            self.intervene_flags.cpu().contiguous()
-            if self.intervene_flags is not None
-            else None
-        )
-
-    def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
-        image_tensor = obs["main_images"] if "main_images" in obs else None
-        wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
-        extra_view_image_tensor = (
-            obs["extra_view_images"] if "extra_view_images" in obs else None
-        )
-        states = obs["states"] if "states" in obs else None
-        task_descriptions = (
-            list(obs["task_descriptions"]) if "task_descriptions" in obs else None
-        )
-
-        return {
-            "main_images": image_tensor,  # [N_ENV, H, W, C]
-            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
-            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
-            "states": states,
-            "task_descriptions": task_descriptions,
-        }
-
-    def to_dict(self):
-        env_output_dict = {}
-
-        env_output_dict["obs"] = self.prepare_observations(self.obs)
-        env_output_dict["final_obs"] = (
-            self.prepare_observations(self.final_obs)
-            if self.final_obs is not None
-            else None
-        )
-        env_output_dict["dones"] = self.dones
-        env_output_dict["terminations"] = self.terminations
-        env_output_dict["truncations"] = self.truncations
-        env_output_dict["rewards"] = self.rewards
-        env_output_dict["intervene_actions"] = self.intervene_actions
-        env_output_dict["intervene_flags"] = self.intervene_flags
-
-        return env_output_dict
-
-
 # @dataclass(kw_only=True)
 # class IRLEnvOutput(EnvOutput):
 #     chunk_observations: Optional[dict[str, Any]] = None
@@ -489,7 +583,7 @@ class EnvOutput:
 #     def __post_init__(self):
 #         super().__post_init__()
 #         self.chunk_observations = (
-#             put_tensor_cpu(self.chunk_observations)
+#             put_tensor_device(self.chunk_observations)
 #             if self.chunk_observations is not None
 #             else None
 #         )
@@ -524,7 +618,7 @@ class RolloutEnvOutput:
     truncations: Optional[torch.Tensor] = None 
 
     def __post_init__(self):
-        self.obs = put_tensor_cpu(self.obs)
+        self.obs = put_tensor_device(self.obs)
         self.dones = (
             self.dones.cpu().contiguous()
             if self.dones is not None
@@ -573,14 +667,16 @@ class RolloutEnvOutput:
 @dataclass(kw_only=True)
 class RewardEnvOutput:
     obs: dict[str, Any]
+    normalized_actions: torch.Tensor
+    chunk_observations: dict[str, Any]
     final_obs: Optional[dict[str, Any]] = None
     dones: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
-    normalized_actions: torch.Tensor
-    next_obs: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
+        self.normalized_actions = self.normalized_actions.cpu().contiguous()
+        self.chunk_observations = put_tensor_device(self.chunk_observations, "cpu")
         self.final_obs = (
             put_tensor_device(self.final_obs, "cpu")
             if self.final_obs is not None
@@ -590,8 +686,8 @@ class RewardEnvOutput:
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
         )
-        self.normalized_actions = self.normalized_actions.cpu().contiguous()
-        self.next_obs = self.next_obs.cpu().contiguous() if self.next_obs is not None else None
+
+    
 
     @staticmethod
     def prepare_observations(obs: dict[str, Any]) -> dict[str, Any]:
@@ -616,14 +712,69 @@ class RewardEnvOutput:
     def to_dict(self):
         return {
             "obs": self.prepare_observations(self.obs),
+            "normalized_actions": self.normalized_actions,
+            "chunk_observations": self.chunk_observations,
             "final_obs": self.prepare_observations(self.final_obs)
             if self.final_obs is not None
             else None,
             "dones": self.dones,
             "rewards": self.rewards,
-            "normalized_actions": self.normalized_actions,
-            "next_obs": self.next_obs,
         }
+    
+# @dataclass(kw_only=True)
+# class RewardEnvOutput:
+#     obs: dict[str, Any]
+#     normalized_actions: torch.Tensor
+#     final_obs: Optional[dict[str, Any]] = None
+#     dones: Optional[torch.Tensor] = None  # [B]
+#     rewards: Optional[torch.Tensor] = None  # [B]
+#     next_obs: Optional[torch.Tensor] = None
+
+#     def __post_init__(self):
+#         self.obs = put_tensor_device(self.obs, "cpu")
+#         self.final_obs = (
+#             put_tensor_device(self.final_obs, "cpu")
+#             if self.final_obs is not None
+#             else None
+#         )
+#         self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
+#         self.rewards = (
+#             self.rewards.cpu().contiguous() if self.rewards is not None else None
+#         )
+#         self.normalized_actions = self.normalized_actions.cpu().contiguous()
+#         self.next_obs = self.next_obs.cpu().contiguous() if self.next_obs is not None else None
+
+#     @staticmethod
+#     def prepare_observations(obs: dict[str, Any]) -> dict[str, Any]:
+#         image_tensor = obs["main_images"] if "main_images" in obs else None
+#         wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+#         extra_view_image_tensor = (
+#             obs["extra_view_images"] if "extra_view_images" in obs else None
+#         )
+#         states = obs["states"] if "states" in obs else None
+#         task_descriptions = (
+#             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
+#         )
+
+#         return {
+#             "main_images": image_tensor,  # [N_ENV, H, W, C]
+#             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
+#             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
+#             "states": states,
+#             "task_descriptions": task_descriptions,
+#         }
+
+#     def to_dict(self):
+#         return {
+#             "obs": self.prepare_observations(self.obs),
+#             "final_obs": self.prepare_observations(self.final_obs)
+#             if self.final_obs is not None
+#             else None,
+#             "dones": self.dones,
+#             "rewards": self.rewards,
+#             "normalized_actions": self.normalized_actions,
+#             "next_obs": self.next_obs,
+#         }
 
 
 @dataclass(kw_only=True)

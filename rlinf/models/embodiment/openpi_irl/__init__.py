@@ -12,10 +12,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
-    from rlinf.models.embodiment.openpi.openpi_action_model import (
-        OpenPi0Config,
-        OpenPi0ForRLActionRewardPrediction,
-    )
+    from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0Config
+    from rlinf.models.embodiment.openpi_irl.openpi_action_irl_model import OpenPi0ForRLActionRewardPrediction
 
     # config
     config_name = getattr(cfg.openpi, "config_name", None)
