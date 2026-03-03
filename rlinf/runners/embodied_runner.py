@@ -324,6 +324,39 @@ class IRLEmbodiedRunner:
 
         self.metric_logger = MetricLogger(cfg)
 
+        # Async logging setup
+        self.stop_logging = False
+        self.log_queue = queue.Queue()
+        self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
+        self.log_thread.start()
+
+    def _log_worker(self):
+        """Background thread for processing log messages."""
+        while not self.stop_logging:
+            try:
+                # Wait for log message with timeout
+                log_func, args = self.log_queue.get(timeout=0.1)
+                log_func(*args)
+                self.log_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Logging error: {e}")
+                continue
+
+    def print_metrics_table_async(
+        self,
+        step: int,
+        total_steps: int,
+        start_time: float,
+        metrics: dict,
+        start_step: int = 0,
+    ):
+        """Async version that puts table printing in queue."""
+        self.log_queue.put(
+            (print_metrics_table, (step, total_steps, start_time, metrics, start_step))
+        )
+
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
         self.actor.init_worker().wait()
@@ -340,9 +373,10 @@ class IRLEmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        ### TODO check discriminator checkpoint needed to be loaded
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
-    def update_weights(self):
+    def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         reward_handle: Handle = self.reward.sync_model_from_actor()
         actor_rollout_handle: Handle = self.actor.sync_model_to_rollout()
@@ -352,21 +386,6 @@ class IRLEmbodiedRunner:
         actor_reward_handle.wait()
         rollout_handle.wait()
         reward_handle.wait()
-
-    # def generate_rollouts(self):
-    #     env_futures = self.env.interact()
-    #     reward_futures = self.reward.predict_rewards()
-    #     rollout_futures = self.rollout.generate()
-    #     actor_futures = self.actor.recv_rollout_batch()
-    #     env_results = env_futures.wait()
-    #     reward_futures.wait()
-    #     actor_futures.wait()
-    #     rollout_futures.wait()
-
-    #     env_results_list = [results for results in env_results if results is not None]
-    #     env_metrics = compute_evaluate_metrics(env_results_list)
-        
-    #     return env_metrics
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -383,33 +402,17 @@ class IRLEmbodiedRunner:
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 
-
     def run(self):
         start_step = self.global_step
-        global_pbar = tqdm(
-            initial=start_step,
-            total=self.max_steps,
-            desc="Global Step",
-            ncols=800,
-        )
+        start_time = time.time()
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
-            eval_metrics = {}
-            if (
-                _step % self.cfg.runner.val_check_interval == 0
-                and self.cfg.runner.val_check_interval > 0
-            ):
-                with self.timer("eval"):
-                    self.update_rollout_weights()
-                    eval_metrics = self.evaluate()
-                    eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                    self.metric_logger.log(data=eval_metrics, step=_step)
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
-                    self.update_weights()
+                    self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
                         input_channel=self.rollout_channel,
@@ -428,8 +431,8 @@ class IRLEmbodiedRunner:
                     self.actor.recv_rollout_batch(
                         input_channel=self.actor_channel
                     ).wait()
-                    reward_handle.wait()
                     rollout_handle.wait()
+                    reward_handle.wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
@@ -438,10 +441,10 @@ class IRLEmbodiedRunner:
                     )
 
                 # actor training.
-                with self.timer("actor_training"):
-                    actor_training_metrics = self.actor.run_training().wait()
+                actor_training_handle: Handle = self.actor.run_training()
+                actor_training_metrics = actor_training_handle.wait()
 
-
+                # TODO check if we need critic training
                 self.global_step += 1
 
                 run_val, save_model, is_train_end = check_progress(
@@ -466,6 +469,27 @@ class IRLEmbodiedRunner:
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+            time_metrics.update(
+                {f"time/env/{k}": v for k, v in env_handle.consume_durations().items()}
+            )
+            time_metrics.update(
+                {
+                    f"time/reward/{k}": v
+                    for k, v in reward_handle.consume_durations().items()
+                }
+            )
+            time_metrics.update(
+                {
+                    f"time/rollout/{k}": v
+                    for k, v in rollout_handle.consume_durations().items()
+                }
+            )
+            time_metrics.update(
+                {
+                    f"time/actor/{k}": v
+                    for k, v in actor_training_handle.consume_durations().items()
+                }
+            )
 
             env_results_list = [
                 results for results in env_handle.wait() if results is not None
@@ -492,10 +516,16 @@ class IRLEmbodiedRunner:
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(training_metrics)
 
-            global_pbar.set_postfix(logging_metrics, refresh=False)
-            global_pbar.update(1)
+            self.print_metrics_table_async(
+                _step, self.max_steps, start_time, logging_metrics, start_step
+            )
 
         self.metric_logger.finish()
+
+        # Stop logging thread
+        self.stop_logging = True
+        self.log_queue.join()  # Wait for all queued logs to be processed
+        self.log_thread.join(timeout=1.0)
 
     def _save_checkpoint(self):
         base_output_dir = os.path.join(
@@ -505,7 +535,7 @@ class IRLEmbodiedRunner:
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
-        self.actor.save_checkpoint(actor_save_path).wait()
+        self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

@@ -34,7 +34,7 @@ from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import get_model_weights_id
-from rlinf.data.io_struct import ActionOutput
+from rlinf.data.embodied_io_struct import ActionOutput
 
 class MultiStepRolloutWorker(Worker):
     def __init__(self, cfg: DictConfig):
@@ -399,7 +399,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
-
+    @Worker.timer("predict")
     def predict(self, env_obs, mode="train"):
         kwargs = (
             self._train_sampling_params
@@ -433,26 +433,75 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
         trajectories: IRLTrajectory = rollout_result.to_splited_trajectories(split_num)
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
-    
-    # def preprocess_chunk_observations(self, env_output: dict[str, torch.Tensor]):
-    #     chunk_obs = env_output.get("chunk_observations")
-    #     if chunk_obs is None:
-    #         return env_output
 
-    #     obs_processor = getattr(self.hf_model, "obs_processor", None)
-    #     input_transform = getattr(self.hf_model, "input_transform", None)
-    #     precision_processor = getattr(self.hf_model, "precision_processor", None)
-    #     if obs_processor is None or input_transform is None or precision_processor is None:
-    #         return env_output
+    @Worker.timer("generate_one_epoch")
+    async def generate_one_epoch(
+        self,
+        env_input_channel: Channel,
+        reward_input_channel: Channel,
+        output_channel: Channel,
+    ):
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+        collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
 
-    #     processed_obs = obs_processor(chunk_obs)
-    #     processed_obs = input_transform(processed_obs)
-    #     processed_obs = precision_processor(processed_obs)
-    #     env_output["chunk_observations"] = processed_obs
+        for _ in range(n_chunk_steps):
+            for stage_id in range(self.num_pipeline_stages):
+                env_output = await self.recv_env_output(env_input_channel)
+                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                actions, result = self.predict(extracted_obs)
+                reward_output = await self.recv_reward(reward_input_channel)
+                # from remote_pdb import RemotePdb
+                # import os
+                # port = 14444 + (os.getpid()%1000)
+                # print(f"entering debug on port {port}")
+                # RemotePdb("127.0.0.0", port).set_trace()
+                normalized_actions = result["normalized_actions"]
+                chunk_step_result = IRLChunkStepResult(
+                    normalized_actions=normalized_actions,
+                    prev_logprobs=result["prev_logprobs"] if collect_prev_infos else None,
+                    prev_values=result["prev_values"] if collect_prev_infos else None,
+                    dones=reward_output["dones"],
+                    rewards=reward_output["rewards"],
+                    truncations=env_output["truncations"],
+                    terminations=env_output["terminations"],
+                    forward_inputs=result["forward_inputs"],
+                    chunk_observations=env_output.get("chunk_observations"),
+                )
+                self.rollout_results[stage_id].append_step_result(chunk_step_result)
 
-    #     return env_output
-    
-    async def generate(self, env_input_channel: Channel, reward_input_channel: Channel, output_channel: Channel, actor_channel: Channel):
+                action_output = ActionOutput(
+                    actions=actions, normalized_actions=normalized_actions
+                )
+                self.send_chunk_actions(output_channel, action_output.to_dict())
+
+        for stage_id in range(self.num_pipeline_stages):
+            reward_output = await self.recv_reward(reward_input_channel)
+            env_output = await self.recv_env_output(env_input_channel)
+            extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+            _, result = self.predict(extracted_obs)
+
+            chunk_step_result = IRLChunkStepResult(
+                dones=reward_output["dones"],
+                rewards=reward_output["rewards"],
+                truncations=env_output["truncations"],
+                terminations=env_output["terminations"],
+                prev_logprobs=None,
+                prev_values=result["prev_values"] if collect_prev_infos else None,
+                forward_inputs=None,
+                chunk_observations=env_output.get("chunk_observations"),
+            )
+            self.rollout_results[stage_id].append_step_result(chunk_step_result)
+
+    async def generate(
+        self,
+        env_input_channel: Channel,
+        reward_input_channel: Channel,
+        output_channel: Channel,
+        actor_channel: Channel,
+    ):
         if self.enable_offload:
             self.reload_model()
 
@@ -464,77 +513,15 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
             for _ in range(self.num_pipeline_stages)
         ]
 
-        n_chunk_steps = (
-            self.cfg.env.train.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
-        )
-        ### todo add chunk_obersavations here, also need to add the last step observation
         for _ in tqdm(
             range(self.cfg.algorithm.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            
-            for i in range(n_chunk_steps):
-                for stage_id in range(self.num_pipeline_stages):
-                    env_output = await self.recv_env_output(env_input_channel)
-                
-                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                    actions, result = self.predict(extracted_obs)
-                    reward_output = await self.recv_reward(reward_input_channel)
-
-                    normalized_actions = result["normalized_actions"]
-                    # result["forward_inputs"].update(
-                    #     {"normalized_actions": normalized_actions}
-                    # )
-                    # if "chunk_observations" in env_output.keys():
-                    #     result["forward_inputs"].update({"chunk_observations": env_output["chunk_observations"]})
-                  
-                    chunk_step_result = IRLChunkStepResult(
-                        normalized_actions=normalized_actions,
-                        prev_logprobs=result["prev_logprobs"],
-                        prev_values=result["prev_values"],
-                        dones=reward_output["dones"],
-                        rewards=reward_output["rewards"],  # the first step is reset step, reward is none, which will not be appended to the buffer
-                        truncations=env_output["truncations"],
-                        terminations=env_output["terminations"],
-                        forward_inputs=result["forward_inputs"],
-                        chunk_observations=env_output["chunk_observations"] if "chunk_observations" in env_output.keys() else None ### chunk_observations is one step behind normalized_actions
-                    )
-                   
-                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
-
-                    action_output = ActionOutput(actions=actions, normalized_actions=normalized_actions)
-                    self.send_chunk_actions(output_channel, action_output.to_dict())
-
-
-            ### receive reward add last image
-            for stage_id in range(self.num_pipeline_stages):
-                # Get dones and rewards from reward worker (final step of epoch)
-                reward_output = await self.recv_reward(reward_input_channel)
-                env_output = await self.recv_env_output(env_input_channel)
-                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                ### TODO add chunk_obs and extracted_obs here to forward_inputs
-                with self.worker_timer():
-                    actions, result = self.predict(extracted_obs)
-
-                 ### TODO add normalized actions from results here to forward_inputs
-                chunk_step_result = IRLChunkStepResult(
-                dones=reward_output['dones'],
-                rewards=reward_output['rewards'],
-                truncations=env_output["truncations"],
-                terminations=env_output["terminations"],
-                prev_logprobs=None,
-                prev_values=result["prev_values"]
-                if self.cfg.rollout.get("collect_prev_infos", True)
-                else None,
-                forward_inputs=None,
-                chunk_observations=env_output["chunk_observations"]
+            await self.generate_one_epoch(
+                env_input_channel, reward_input_channel, output_channel
             )
 
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
-            
-            
         for stage_id in range(self.num_pipeline_stages):
             await self.send_rollout_trajectories(
                 self.rollout_results[stage_id], actor_channel

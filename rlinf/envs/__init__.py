@@ -18,6 +18,7 @@ from enum import Enum
 class SupportedEnvType(Enum):
     MANISKILL = "maniskill"
     LIBERO = "libero"
+    LIBEROIRL = "liberoirl"
     ROBOTWIN = "robotwin"
     ISAACLAB = "isaaclab"
     METAWORLD = "metaworld"
@@ -57,6 +58,10 @@ def get_env_cls(env_type: str, env_cfg=None, enable_offload=False):
         from rlinf.envs.libero.libero_env import LiberoEnv
 
         return LiberoEnv
+    elif env_type == SupportedEnvType.LIBEROIRL:
+        from rlinf.envs.libero.libero_env import IRLLiberoEnv
+
+        return IRLLiberoEnv
     elif env_type == SupportedEnvType.ROBOTWIN:
         from rlinf.envs.robotwin.robotwin_env import RoboTwinEnv
 

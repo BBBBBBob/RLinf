@@ -494,44 +494,43 @@ class LiberoEnv(gym.Env):
         self.render_images = []
 
 
-### Not used currently
 class IRLLiberoEnv(LiberoEnv):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
-        super().__init__(cfg, num_envs, seed_offset, total_num_processes)
-    
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+        super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
+
     def chunk_step(self, chunk_actions, last_extracted_obs):
-         # chunk_actions: [num_envs, chunk_step, action_dim]
+        # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         chunk_observations = {}
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
 
-        for key, value in last_extracted_obs.items():
-            if key != "task_descriptions":
-                chunk_observations[key] = torch.empty(
-                    (value.shape[0], chunk_size, *value.shape[1:]),
-                    dtype=value.dtype,
-                    device=value.device,
-                )
-                chunk_observations[key][:, 0] = value
-        chunk_observations["task_descriptions"] = list(
-            last_extracted_obs["task_descriptions"]
-        )
+        obs_keys = [key for key in last_extracted_obs.keys() if key != "task_descriptions"]
+        for key in obs_keys:
+            value = last_extracted_obs[key]
+            chunk_observations[key] = torch.empty(
+                (value.shape[0], chunk_size, *value.shape[1:]),
+                dtype=value.dtype,
+                device=value.device,
+            )
+            chunk_observations[key][:, 0] = value
+        task_descriptions = [list(last_extracted_obs["task_descriptions"])]
+
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
             if i < chunk_size - 1:
-                for key, value in extracted_obs.items():
-                    if key != "task_descriptions":
-                        chunk_observations[key][:, i + 1] = value
-                chunk_observations["task_descriptions"].append(last_extracted_obs["task_descriptions"])
-                
+                for key in obs_keys:
+                    chunk_observations[key][:, i + 1] = extracted_obs[key]
+                task_descriptions.append(list(extracted_obs["task_descriptions"]))
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+
+        chunk_observations["task_descriptions"] = task_descriptions
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(

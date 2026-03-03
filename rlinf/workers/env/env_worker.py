@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from rlinf.data.io_struct import EnvOutput, RolloutEnvOutput, RewardEnvOutput
+from rlinf.data.embodied_io_struct import EnvOutput, RolloutEnvOutput, RewardEnvOutput
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.env_manager import EnvManager

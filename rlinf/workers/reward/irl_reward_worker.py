@@ -17,7 +17,7 @@ import gc
 import torch
 from omegaconf import DictConfig, open_dict
 
-from rlinf.data.io_struct import RewardOutput
+from rlinf.data.embodied_io_struct import RewardOutput
 from rlinf.config import SupportedModel
 from rlinf.models import get_model
 from rlinf.scheduler import Channel, Worker, Cluster
