@@ -140,17 +140,17 @@ class ChunkStepResult:
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
 
-### todo rewrite IRLChunkStepResult I want to inheritate from ChunkStepResult
+
 @dataclass(kw_only=True)
 class IRLChunkStepResult(ChunkStepResult):
     """Chunk step outputs with additional IRL-specific fields."""
 
-    normalized_actions: torch.Tensor = None  # [B, len, action_dim]
+    # normalized_actions: torch.Tensor = None  # [B, len, action_dim]
     chunk_observations: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.normalized_actions is not None:
-            self.normalized_actions = self.normalized_actions.cpu().contiguous()
+        # if self.normalized_actions is not None:
+        #     self.normalized_actions = self.normalized_actions.cpu().contiguous()
         if self.chunk_observations:
             self.chunk_observations = put_tensor_device(self.chunk_observations, "cpu")
         super().__post_init__()
@@ -184,7 +184,7 @@ class IRLTrajectory(Trajectory):
     trajectory contains multiple episodes.
     """
 
-    normalized_actions: torch.Tensor = None
+    # normalized_actions: torch.Tensor = None
     chunk_observations: dict[str, Any] = field(default_factory=dict)
 
 
@@ -363,7 +363,7 @@ class IRLEmbodiedRolloutResult(EmbodiedRolloutResult):
     and convert them into trajectory tensors.
     """
 
-    normalized_actions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
+    # normalized_actions: list[torch.Tensor] = field(default_factory=list)  # trajectory_length
     chunk_observations: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
@@ -372,8 +372,8 @@ class IRLEmbodiedRolloutResult(EmbodiedRolloutResult):
         if result.actions is not None:
             self.actions.append(result.actions)
             self.intervene_flags.append(torch.zeros(1, dtype=torch.bool))
-        if result.normalized_actions is not None:
-            self.normalized_actions.append(result.normalized_actions)
+        # if result.normalized_actions is not None:
+        #     self.normalized_actions.append(result.normalized_actions)
         if result.rewards is not None:
             self.rewards.append(result.rewards)
         if result.terminations is not None:
@@ -403,8 +403,8 @@ class IRLEmbodiedRolloutResult(EmbodiedRolloutResult):
             trajectory.intervene_flags = (
                 torch.stack(self.intervene_flags, dim=0).cpu().contiguous()
             )
-        if len(self.normalized_actions) > 0:
-            trajectory.normalized_actions = torch.stack(self.normalized_actions, dim=0).cpu().contiguous()
+        # if len(self.normalized_actions) > 0:
+        #     trajectory.normalized_actions = torch.stack(self.normalized_actions, dim=0).cpu().contiguous()
         if len(self.rewards) > 0:
             trajectory.rewards = torch.stack(self.rewards, dim=0).cpu().contiguous()
         if len(self.terminations) > 0:
@@ -509,9 +509,8 @@ class IRLEmbodiedRolloutResult(EmbodiedRolloutResult):
 
         return splited_trajectories
     
-
 def convert_trajectories_to_batch(
-    trajectories: list[Trajectory],
+    trajectories: list[Trajectory | IRLTrajectory],
 ) -> dict[str, torch.Tensor]:
     """
     convert a list of trajectories to a batch dict, the shape of the batch is [T, B, ...].
@@ -559,6 +558,20 @@ def convert_trajectories_to_batch(
             ]
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+    
+    if trajectories[0].chunk_observations:
+        all_keys: set[str] = set()
+        for traj in trajectories:
+            all_keys.update(traj.chunk_observations.keys())
+        batch["chunk_observations"] = {}
+        for key in all_keys:
+            tensors = [
+                traj.chunk_observations[key]
+                for traj in trajectories
+                if key in traj.chunk_observations
+            ]
+            if tensors:
+                batch["chunk_observations"][key] = torch.cat(tensors, dim=1)
 
     # -------- tensor fields --------
     for field_name in trajectories[0].__dataclass_fields__.keys():
@@ -618,7 +631,7 @@ class RolloutEnvOutput:
     truncations: Optional[torch.Tensor] = None 
 
     def __post_init__(self):
-        self.obs = put_tensor_device(self.obs)
+        self.obs = put_tensor_device(self.obs, "cpu")
         self.dones = (
             self.dones.cpu().contiguous()
             if self.dones is not None
@@ -666,7 +679,7 @@ class RolloutEnvOutput:
 
 @dataclass(kw_only=True)
 class RewardEnvOutput:
-    obs: dict[str, Any]
+    # obs: dict[str, Any]
     normalized_actions: torch.Tensor
     chunk_observations: dict[str, Any]
     final_obs: Optional[dict[str, Any]] = None
@@ -674,7 +687,7 @@ class RewardEnvOutput:
     rewards: Optional[torch.Tensor] = None  # [B]
 
     def __post_init__(self):
-        self.obs = put_tensor_device(self.obs, "cpu")
+        # self.obs = put_tensor_device(self.obs, "cpu")
         self.normalized_actions = self.normalized_actions.cpu().contiguous()
         self.chunk_observations = put_tensor_device(self.chunk_observations, "cpu")
         self.final_obs = (
@@ -686,8 +699,6 @@ class RewardEnvOutput:
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
         )
-
-    
 
     @staticmethod
     def prepare_observations(obs: dict[str, Any]) -> dict[str, Any]:
@@ -711,7 +722,7 @@ class RewardEnvOutput:
 
     def to_dict(self):
         return {
-            "obs": self.prepare_observations(self.obs),
+            # "obs": self.prepare_observations(self.obs),
             "normalized_actions": self.normalized_actions,
             "chunk_observations": self.chunk_observations,
             "final_obs": self.prepare_observations(self.final_obs)
@@ -781,6 +792,7 @@ class RewardEnvOutput:
 class RewardOutput:
     rewards: Optional[torch.Tensor] = None
     dones: Optional[torch.Tensor] = None
+    chunk_observations: dict[str, Any] = None 
     # last_obs: Optional[torch.Tensor] = None
 
     def __post_init__(self):
@@ -796,6 +808,12 @@ class RewardOutput:
             else None
         )
 
+        self.chunk_observations = (
+            put_tensor_device(self.chunk_observations, "cpu")
+            if self.chunk_observations is not None
+            else None
+        )
+
         # self.last_obs = (
         #     self.last_obs.cpu().contiguous()
         #     if self.last_obs is not None
@@ -806,7 +824,7 @@ class RewardOutput:
         reward_output_dict = {}
         reward_output_dict["rewards"] = self.rewards
         reward_output_dict["dones"] = self.dones
-        # reward_output_dict["last_obs"] = self.last_obs
+        reward_output_dict["chunk_observations"] = self.chunk_observations
 
         return reward_output_dict
 
@@ -826,4 +844,3 @@ class ActionOutput:
 
         return action_output_dict
     
-

@@ -162,7 +162,7 @@ def prepare_actions(
     wm_env_type=None,
 ) -> torch.Tensor | np.ndarray:
     env_type = SupportedEnvType(env_type)
-    if env_type == SupportedEnvType.LIBERO:
+    if env_type == SupportedEnvType.LIBERO or env_type == SupportedEnvType.LIBEROIRL:
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,

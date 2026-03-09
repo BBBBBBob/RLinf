@@ -515,7 +515,10 @@ class IRLLiberoEnv(LiberoEnv):
                 device=value.device,
             )
             chunk_observations[key][:, 0] = value
-        task_descriptions = [list(last_extracted_obs["task_descriptions"])]
+        task_descriptions = [
+            [task_description]
+            for task_description in last_extracted_obs["task_descriptions"]
+        ]
 
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
@@ -525,11 +528,15 @@ class IRLLiberoEnv(LiberoEnv):
             if i < chunk_size - 1:
                 for key in obs_keys:
                     chunk_observations[key][:, i + 1] = extracted_obs[key]
-                task_descriptions.append(list(extracted_obs["task_descriptions"]))
+                for env_task_descriptions, task_description in zip(
+                    task_descriptions, extracted_obs["task_descriptions"]
+                ):
+                    env_task_descriptions.append(task_description)
+                    
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
-
+        
         chunk_observations["task_descriptions"] = task_descriptions
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]

@@ -357,13 +357,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
-            "observation/image": env_obs["main_images"],
-            "observation/state": env_obs["states"],
+            # "observation/image": env_obs["main_images"],
+            # "observation/state": env_obs["states"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
         }
-        if env_obs["wrist_images"] is not None:
-            forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
+        # if env_obs["wrist_images"] is not None:
+        #     forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
         forward_inputs.update(to_process_obs)
         forward_inputs.pop("prompt", None)
 
@@ -387,7 +387,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         bsize = observation.state.shape[0]
         device = observation.state.device
         num_steps = self.config.num_steps
-
+        
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)

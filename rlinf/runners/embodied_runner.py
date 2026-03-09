@@ -373,7 +373,7 @@ class IRLEmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        ### TODO check discriminator checkpoint needed to be loaded
+        
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
@@ -428,7 +428,7 @@ class IRLEmbodiedRunner:
                         output_channel=self.rollout_channel,
                         actor_channel=self.actor_channel,
                     )
-                    self.actor.recv_rollout_batch(
+                    self.actor.recv_rollout_trajectories(
                         input_channel=self.actor_channel
                     ).wait()
                     rollout_handle.wait()
@@ -443,8 +443,7 @@ class IRLEmbodiedRunner:
                 # actor training.
                 actor_training_handle: Handle = self.actor.run_training()
                 actor_training_metrics = actor_training_handle.wait()
-
-                # TODO check if we need critic training
+                
                 self.global_step += 1
 
                 run_val, save_model, is_train_end = check_progress(

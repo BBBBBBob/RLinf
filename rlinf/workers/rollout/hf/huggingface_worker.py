@@ -450,17 +450,11 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
         for _ in range(n_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(env_input_channel)
-                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                actions, result = self.predict(extracted_obs)
+                actions, result = self.predict(env_output["obs"])
                 reward_output = await self.recv_reward(reward_input_channel)
-                # from remote_pdb import RemotePdb
-                # import os
-                # port = 14444 + (os.getpid()%1000)
-                # print(f"entering debug on port {port}")
-                # RemotePdb("127.0.0.0", port).set_trace()
-                normalized_actions = result["normalized_actions"]
+                normalized_actions = result["normalized_actions"][:, :self.cfg.actor.model.num_action_chunks]
                 chunk_step_result = IRLChunkStepResult(
-                    normalized_actions=normalized_actions,
+                    # normalized_actions=normalized_actions,
                     prev_logprobs=result["prev_logprobs"] if collect_prev_infos else None,
                     prev_values=result["prev_values"] if collect_prev_infos else None,
                     dones=reward_output["dones"],
@@ -468,7 +462,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                     truncations=env_output["truncations"],
                     terminations=env_output["terminations"],
                     forward_inputs=result["forward_inputs"],
-                    chunk_observations=env_output.get("chunk_observations"),
+                    chunk_observations=reward_output["chunk_observations"],
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
 
@@ -480,8 +474,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
         for stage_id in range(self.num_pipeline_stages):
             reward_output = await self.recv_reward(reward_input_channel)
             env_output = await self.recv_env_output(env_input_channel)
-            extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-            _, result = self.predict(extracted_obs)
+            _, result = self.predict(env_output["obs"])
 
             chunk_step_result = IRLChunkStepResult(
                 dones=reward_output["dones"],
@@ -491,7 +484,7 @@ class IRLMultiStepRolloutWorker(MultiStepRolloutWorker):
                 prev_logprobs=None,
                 prev_values=result["prev_values"] if collect_prev_infos else None,
                 forward_inputs=None,
-                chunk_observations=env_output.get("chunk_observations"),
+                chunk_observations=reward_output["chunk_observations"],
             )
             self.rollout_results[stage_id].append_step_result(chunk_step_result)
 

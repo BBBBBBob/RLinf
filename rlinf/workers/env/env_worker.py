@@ -448,11 +448,15 @@ class EnvWorker(Worker):
 class IRLEnvWorker(EnvWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-       
-    ### typing might not be correct
+
+    @Worker.timer("env_interact_step")
     def env_interact_step(
-        self, chunk_actions: np.ndarray, chunk_normalized_actions: torch.Tensor, last_extracted_obs: dict[str, Any], stage_id: int
-    ) -> tuple[EnvOutput, dict[str, Any]]:
+        self,
+        chunk_actions: np.ndarray,
+        chunk_normalized_actions: torch.Tensor,
+        last_extracted_obs: dict[str, Any],
+        stage_id: int,
+    ) -> tuple[RolloutEnvOutput, RewardEnvOutput, dict[str, Any]]:
         """
         This function is used to interact with the environment.
         Rewrite for IRL
@@ -464,17 +468,13 @@ class IRLEnvWorker(EnvWorker):
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
+            wm_env_type=self.cfg.env.train.get("wm_env_type", None),
         )
         env_info = {}
-        ### Only for LIBERO-IRL, observation chunk is not correct
-        ### IRL takes current observation and action pair
-        ### This is for the each step and action pairs
+
         extracted_obs, chunk_observations, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
-            self.simulator_list[stage_id].chunk_step(chunk_actions, last_extracted_obs)
+            self.env_list[stage_id].chunk_step(chunk_actions, last_extracted_obs)
         )
-        # extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
-        #     self.env_list[stage_id].chunk_step(chunk_actions)
-        # )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if not self.cfg.env.train.auto_reset:
@@ -494,16 +494,6 @@ class IRLEnvWorker(EnvWorker):
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
-        # intervene_actions = (
-        #     infos["intervene_action"] if "intervene_action" in infos else None
-        # )
-        # intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        # if self.cfg.env.train.auto_reset and chunk_dones.any():
-        #     if "intervene_action" in infos["final_info"]:
-        #         intervene_actions = infos["final_info"]["intervene_action"]
-        #         intervene_flags = infos["final_info"]["intervene_flag"]
-
-        ### TODO Checking huggingface_worker
         rollout_env_output = RolloutEnvOutput(
             obs=extracted_obs,
             dones=chunk_dones,
@@ -512,7 +502,7 @@ class IRLEnvWorker(EnvWorker):
         )
 
         reward_env_output = RewardEnvOutput(
-            obs=last_extracted_obs,
+            # obs=last_extracted_obs,
             normalized_actions=chunk_normalized_actions,
             chunk_observations=chunk_observations,
             final_obs=infos["final_observation"]
@@ -524,6 +514,7 @@ class IRLEnvWorker(EnvWorker):
 
         return rollout_env_output, reward_env_output, env_info
 
+    @Worker.timer("interact")
     def interact(self, input_channel: Channel, output_channel: Channel):
         for env in self.env_list:
             env.start_env()
@@ -563,13 +554,21 @@ class IRLEnvWorker(EnvWorker):
             else:
                 self.num_done_envs = 0
                 self.num_succ_envs = 0
+                dones = (
+                    torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
+                    .unsqueeze(1)
+                    .repeat(1, self.cfg.actor.model.num_action_chunks)
+                )
+                terminations = dones.clone()
+                truncations = dones.clone()
+
                 for stage_id in range(self.stage_num):
                     env_output = EnvOutput(
                         obs=self.last_obs_list[stage_id],
                         rewards=None,
-                        dones=self.last_dones_list[stage_id],
-                        terminations=self.last_terminations_list[stage_id],
-                        truncations=self.last_truncations_list[stage_id],
+                        dones=dones,
+                        terminations=terminations,
+                        truncations=truncations,
                         intervene_actions=self.last_intervened_info_list[stage_id][0],
                         intervene_flags=self.last_intervened_info_list[stage_id][1],
                     )
@@ -604,15 +603,12 @@ class IRLEnvWorker(EnvWorker):
                             env_metrics[key].append(value)
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
-            self.last_dones_list = [env_output.dones for env_output in env_output_list]
-            self.last_truncations_list = [
-                env_output.truncations for env_output in env_output_list
-            ]
-            self.last_terminations_list = [
-                env_output.terminations for env_output in env_output_list
-            ]
             self.last_intervened_info_list = [
-                (None, None) if not hasattr(env_output, "intervene_actions") else (env_output.intervene_actions, env_output.intervene_flags)
+                (
+                    (None, None)
+                    if not hasattr(env_output, "intervene_actions")
+                    else (env_output.intervene_actions, env_output.intervene_flags)
+                )
                 for env_output in env_output_list
             ]
             self.finish_rollout()

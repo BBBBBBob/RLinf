@@ -29,7 +29,7 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel
-from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
+from rlinf.data.embodied_io_struct import Trajectory, IRLTrajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
     FSDPModelManager,
@@ -71,7 +71,6 @@ from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 import openpi.training.data_loader as openpi_data_loader
 
 
-
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
     original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
@@ -91,7 +90,6 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
     return ret_dict
-
 
 def process_nested_dict_for_train(nested_dict, shuffle_id):
     ret_dict = {}
@@ -1020,7 +1018,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
-                    
+
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1116,6 +1114,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
+       
         self._reward_group_name = cfg.reward.group_name
         self.disc_enable_offload = self.cfg.reward.get("enable_offload", False)
         self.data_loader = self.build_dataloader()
@@ -1196,7 +1195,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     def build_dataloader(self):
         config = get_openpi_config(
-            self.cfg.actor.model.openpi.config_name,
+            self.cfg.actor.model.openpi.config_name + "_expert",
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.reward.micro_batch_size
         )
@@ -1205,7 +1204,25 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
         return data_loader
     
-        
+    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+        """
+        Receive rollout trajectories from rollout workers.
+
+        Args:
+            input_channel: The input channel to read from.
+        """
+        send_num = self._component_placement.get_world_size("rollout") * self.stage_num
+        recv_num = self._component_placement.get_world_size("actor")
+        split_num = compute_split_num(send_num, recv_num)
+
+        recv_list = []
+        for _ in range(split_num):
+            trajectory: IRLTrajectory = await input_channel.get(async_op=True).async_wait()
+            recv_list.append(trajectory)
+
+        self.rollout_batch = convert_trajectories_to_batch(recv_list)
+        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
     def run_training(self):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -1219,34 +1236,28 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
+        discriminator_size = rollout_size * self.cfg.actor.model.num_action_chunks
+
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
-    
+        shuffle_ac_id = torch.randperm(rollout_size, generator=g)
+        shuffle_disc_id = torch.randperm(discriminator_size, generator=g)
+        actor_critic_batch = {
+            key: value
+            for key, value in self.rollout_batch.items()
+            if key != "chunk_observations"
+        }
+        discriminator_batch = self.rollout_batch["chunk_observations"]
+
         with torch.no_grad():
-            self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
-            )
+            actor_critic_batch = process_nested_dict_for_train(actor_critic_batch, shuffle_ac_id)
+            discriminator_batch = process_nested_dict_for_train(discriminator_batch, shuffle_disc_id)
 
         assert (
             self.cfg.actor.global_batch_size
             % (self.cfg.actor.micro_batch_size * self._world_size)
             == 0
         ), "global_batch_size is not divisible by micro_batch_size * world_size"
-
-        ### filter out observation/next_image
-        actor_critic_batch = {}
-        discriminator_batch = {}
-
-        for key, value in self.rollout_batch.items():
-            if key != "observation/next_image":
-                actor_critic_batch[key] = value
-            if (
-                "observation" in key
-                or "tokenized_prompt" in key
-                or "normalized_actions" in key
-            ):
-                discriminator_batch[key] = value
 
         self.gradient_accumulation = (
             self.cfg.actor.global_batch_size
@@ -1261,7 +1272,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        rollout_size = self.rollout_batch["prev_logprobs"].size(0)  ## rollout_size is the total batch from the rollout
+        rollout_size = actor_critic_batch["prev_logprobs"].size(0)  ## rollout_size is the total batch from the rollout
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
@@ -1270,7 +1281,7 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
-            rollout_dataloader_iter = get_iterator_k_split(
+            rollout_dataloader_iter = split_dict_to_chunk(
                 actor_critic_batch,
                 rollout_size // batch_size_per_rank,
             )
@@ -1285,35 +1296,42 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                 assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
-                train_micro_batch = get_iterator_k_split(
+                train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
 
                 self.optimizer.zero_grad()
-                for idx, data in enumerate(train_micro_batch):
-                    data = put_tensor_device(
-                        data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                for idx, batch in enumerate(train_micro_batch):
+                    batch = put_tensor_device(
+                        batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
                     )
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
                     )
-                    advantages = data["advantages"]
-                    prev_logprobs = data["prev_logprobs"]
-                    returns = data.get("returns", None)
-                    prev_values = data.get("prev_values", None)
-                    loss_mask = data.get("loss_mask", None)
-                    loss_mask_sum = data.get("loss_mask_sum", None)
+                    advantages = batch["advantages"]
+                    prev_logprobs = batch["prev_logprobs"]
+                    returns = batch.get("returns", None)
+                    prev_values = batch.get("prev_values", None)
+                    loss_mask = batch.get("loss_mask", None)
+                    loss_mask_sum = batch.get("loss_mask_sum", None)
+                    forward_inputs = batch.get("forward_inputs", None)
 
+                    kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
-                        data["temperature"] = (
+                        kwargs["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
-                        data["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                    elif (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.GR00T
+                    ):
+                        kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
@@ -1321,17 +1339,19 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                     
                     with self.amp_context:
                         output_dict = self.model(
-                            data=data,
+                            data=forward_inputs,
                             head_name="actor_critic",
                             compute_logprobs=True,
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                             compute_values=compute_values,
                             use_cache=False,
+                            **kwargs
                         )
 
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.GR00T
-                    ]:
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.GR00T
+                    ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
                     kwargs = {
@@ -1372,7 +1392,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                         )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-
                     metrics_data["entropy_loss"] = entropy_loss.detach().item()
 
                     loss /= self.gradient_accumulation
@@ -1398,15 +1417,20 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         clear_memory()
 
         ### training discriminator
+        disc_rollout_size = discriminator_batch["normalized_actions"].size(0)  ## rollout_size is the total batch from the rollout
+        disc_batch_size_per_rank = self.cfg.reward.global_batch_size // self._world_size
+        assert disc_rollout_size % disc_batch_size_per_rank == 0, (
+            f"{disc_rollout_size} is not divisible by {disc_batch_size_per_rank}"
+        )
         irl_update_epoch = self.cfg.algorithm.get("irl_update_epoch", 1)
         for _ in range(irl_update_epoch):
-            rollout_dataloader_iter = get_iterator_k_split(
+            rollout_dataloader_iter = split_dict_to_chunk(
                 discriminator_batch,
-                rollout_size // batch_size_per_rank * 2,
+                disc_rollout_size // disc_batch_size_per_rank,
             )
             for train_global_batch in rollout_dataloader_iter:
                 train_global_batch_size = train_global_batch["normalized_actions"].shape[0]
-    
+                
                 assert (
                     train_global_batch_size
                     == self.cfg.reward.global_batch_size
@@ -1416,18 +1440,21 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                     f"{train_global_batch_size=}, {self.cfg.reward.micro_batch_size}"
                 )
                 ### ensure the observation chunk and the action chunk have the same first two dimensionalities
-                train_micro_batch = get_iterator_k_split(
+                train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
                     train_global_batch_size // self.cfg.reward.micro_batch_size,
                 )
-
                 self.discriminator_optimizer.zero_grad()
-                for idx, data in enumerate(train_micro_batch):
-                    policy_data = put_tensor_device(
-                        data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+             
+                for idx, batch in enumerate(train_micro_batch):
+                    policy_batch = put_tensor_device(
+                        batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
                     )
                     
                     observation, actions = next(self.data_iter)
+                    # from remote_pdb import RemotePdb
+                    # port = 14444 + (os.getpid() % 1000)
+                    # RemotePdb(os.getenv("RAY_ADDRESS").split(":")[0], port).set_trace()
                     observation = jax.tree.map(
                         lambda x: torch.as_tensor(x, device=f"cuda:{int(os.environ['LOCAL_RANK'])}")
                         .contiguous()
@@ -1435,11 +1462,11 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                         observation,
                     )
                     actions = actions.to(device=f"cuda:{int(os.environ['LOCAL_RANK'])}", dtype=torch.float32)
-                    expert_data = {
+                    expert_batch = {
                         "observation": observation,
-                        "normalized_actions": actions,
+                        "normalized_actions": actions.squeeze(), ### needed for mlp 
                     } 
-                    assert policy_data["normalized_actions"].shape[0] == expert_data["normalized_actions"].shape[0], "batch size of policy and expert should be the same"
+                    assert policy_batch["normalized_actions"].shape[0] == expert_batch["normalized_actions"].shape[0], "batch size of policy and expert should be the same"
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.disc_gradient_accumulation,
@@ -1447,12 +1474,12 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                     with self.amp_context:
                         policy_disc_output = self.model(
-                            data=policy_data,
+                            data=policy_batch,
                             head_name="discriminator",
                             data_type="policy" 
                         )
                         expert_disc_output = self.model(
-                            data=expert_data,
+                            data=expert_batch,
                             head_name="discriminator",
                             data_type="expert" 
                         )

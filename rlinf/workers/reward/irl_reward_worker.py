@@ -82,6 +82,7 @@ class IRLRewardWorker(Worker):
 
         dones = env_output["dones"].bool().cpu().contiguous()
         rewards = env_output["rewards"].cpu().contiguous()
+        
         if pred_rewards is not None:
             rewards += pred_rewards.cpu().contiguous()
         # Handle auto_reset: add bootstrap value to rewards for done episodes
@@ -106,46 +107,59 @@ class IRLRewardWorker(Worker):
         return dones, rewards
     
 
+    @Worker.timer("predict_reward")
     def _predict_rewards(self, env_output: dict[str, torch.Tensor]) -> torch.Tensor:
         predict_fn = getattr(self.hf_model, "predict_reward_batch", None)
         if predict_fn is None:
             raise AttributeError("Reward prediction method is not available.")
         with torch.no_grad():
             return predict_fn(env_output)
-        
-    async def predict_rewards(self, input_channel: Channel, output_channel: Channel):
-        if self.enable_offload:
-            self.reload_model()
 
+    @Worker.timer("predict_rewards_one_epoch")
+    async def predict_rewards_one_epoch(
+        self, input_channel: Channel, output_channel: Channel
+    ):
         n_chunk_steps = (
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
         )
-        for _ in range(self.cfg.algorithm.rollout_epoch):
-            for _ in range(n_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
-                    env_output = await self.recv_env_output(input_channel)
-                    if (
-                        "normalized_actions" in env_output
-                        # "next_obs" in env_output
-                        # and "normalized_actions" in env_output
-                    ):
-                        assert env_output['rewards'] is not None, "Rewards must be in the env_output"
-                        ### Maybe add extracted_obs
-                        pred_rewards = self._predict_rewards(env_output)
-                        dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
-                        reward_output = RewardOutput(rewards=rewards, dones=dones)
-                    else:
-                        reward_output = RewardOutput(rewards=None, dones=env_output['dones'].bool().cpu().contiguous())
-                    self.send_reward(output_channel, reward_output.to_dict())
-
+        for _ in range(n_chunk_steps):
             for _ in range(self.num_pipeline_stages):
-                assert "normalized_actions" in env_output and env_output['rewards'] is not None, "env_output structure is not correct"
-                env_output =  await self.recv_env_output(input_channel)
-                pred_rewards = self._predict_rewards(env_output)
-                dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
-                reward_output = RewardOutput(rewards=rewards, dones=dones)
+                env_output = await self.recv_env_output(input_channel)
+                if "normalized_actions" in env_output:
+                    assert (
+                        env_output["rewards"] is not None
+                    ), "Rewards must be in the env_output"
+                    pred_rewards, chunk_observations = self._predict_rewards(env_output)
+                    dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
+                    reward_output = RewardOutput(rewards=rewards, dones=dones, chunk_observations=chunk_observations)
+                else:
+                    reward_output = RewardOutput(
+                        rewards=None,
+                        dones=env_output["dones"].bool().cpu().contiguous(),
+                        chunk_observations=None,
+                    )
                 self.send_reward(output_channel, reward_output.to_dict())
+
+        for _ in range(self.num_pipeline_stages):
+            env_output = await self.recv_env_output(input_channel)
+            assert (
+                "normalized_actions" in env_output and env_output["rewards"] is not None
+            ), "env_output structure is not correct"
+            pred_rewards, chunk_observations = self._predict_rewards(env_output)
+            dones, rewards = self.get_dones_and_rewards(env_output, pred_rewards)
+            reward_output = RewardOutput(rewards=rewards, dones=dones, chunk_observations=chunk_observations)
+            self.send_reward(output_channel, reward_output.to_dict())
+
+    async def predict_rewards(self, input_channel: Channel, output_channel: Channel):
+        if self.enable_offload:
+            self.reload_model()
+
+        for _ in range(self.cfg.algorithm.rollout_epoch):
+            await self.predict_rewards_one_epoch(input_channel, output_channel)
+
+        if self.enable_offload:
+            self.offload_model()
 
     def send_reward(self, output_channel: Channel, rewards: dict[str, torch.Tensor], mode="train"):
         assert mode in ["train", "eval"], f"{mode=} is not supported"
