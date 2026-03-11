@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Mapping, Union
+from typing import Iterable, Mapping, Union
 
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -43,9 +43,14 @@ class Checkpoint(Stateful):
         self.opts = opts
         self.fsdp_version = fsdp_version
 
+    def _torch_optimizers(self) -> Union[Optimizer, Iterable[Optimizer]]:
+        if isinstance(self.optimizer, Mapping):
+            return tuple(self.optimizer.values())
+        return self.optimizer
+
     def state_dict(self):
         model_sd, optim_sd = get_state_dict(
-            model=self.model, optimizers=self.optimizer, options=self.opts
+            model=self.model, optimizers=self._torch_optimizers(), options=self.opts
         )
         out = {"model": model_sd, "optim": optim_sd, "fsdp_version": self.fsdp_version.value}
         if isinstance(self.lr_scheduler, Mapping):
@@ -74,7 +79,7 @@ class Checkpoint(Stateful):
                 optim_state = {first_key: optim_state}
         set_state_dict(
             model=self.model,
-            optimizers=self.optimizer,
+            optimizers=self._torch_optimizers(),
             model_state_dict=state["model"],
             optim_state_dict=optim_state,
             options=self.opts,

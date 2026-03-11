@@ -20,9 +20,9 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "../results"
+    log_path: "/home/j84403411/RLinf/results"
     project_name: rlinf
-    experiment_name: "libero_object_ppo_openpi_pi05"
+    experiment_name: "libero_object_ppo_openpi_pi05_irl"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -170,7 +170,6 @@ actor:
   
 reward:
   use_reward_model: True
-  use_next_image: False
   group_name: "RewardGroup"
   micro_batch_size: 10
   global_batch_size: 10

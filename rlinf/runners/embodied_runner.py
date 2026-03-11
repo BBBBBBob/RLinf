@@ -533,9 +533,13 @@ class IRLEmbodiedRunner:
             f"checkpoints/global_step_{self.global_step}",
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
+        # save_start_time = time.perf_counter()
         os.makedirs(actor_save_path, exist_ok=True)
+        # print(f"Starting to save model to {actor_save_path}", flush=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
-
+        # save_duration = time.perf_counter() - save_start_time
+        # print(f"Model saved to {actor_save_path} in {save_duration:.2f}s", flush=True)
+        
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
         self.max_steps = self.num_steps_per_epoch * self.cfg.runner.max_epochs

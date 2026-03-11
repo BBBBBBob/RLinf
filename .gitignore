@@ -19,4 +19,6 @@ outputs/*
 uv.lock
 rlinf/envs/maniskill/assets
 model/
+data/
+download_model/
 openpi-venv/
