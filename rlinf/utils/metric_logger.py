@@ -74,7 +74,6 @@ class MetricLogger:
                 config=config,
                 settings=settings,
                 dir=wandb_log_path,
-                mode="disabled"
             )
             self.logger["wandb"] = wandb
 

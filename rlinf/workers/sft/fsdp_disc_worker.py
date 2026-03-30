@@ -31,7 +31,7 @@ from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import clear_memory
 
 
-class FSDPSftWorker(FSDPModelManager, Worker):
+class FSDPDiscWorker(FSDPModelManager, Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
