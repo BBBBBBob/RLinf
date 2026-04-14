@@ -1,3 +1,10 @@
+#!/bin/bash
+#SBATCH --job-name=sft
+#SBATCH --gres=gpu:1
+#SBATCH --partition=agent-xlong
+#SBATCH --time=100:00:00
+#SBATCH --output=slurm_logs/slurm_%j.out
+
 export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/ray_tmp_${USER}}
 mkdir -p "$RAY_TMPDIR"
 chmod 700 "$RAY_TMPDIR" 2>/dev/null || true
@@ -39,4 +46,4 @@ ray start --head \
   --num-cpus="$NUM_CPUS" \
   --disable-usage-stats
 
-bash examples/embodiment/run_embodiment_irl.sh libero_object_ppo_openpi_pi05_irl
+bash examples/sft/run_embodiment_disc.sh libero_sft_openpi05_object_irl_disc

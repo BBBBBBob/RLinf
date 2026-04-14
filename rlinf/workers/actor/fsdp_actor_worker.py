@@ -1194,8 +1194,12 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
             self.offload_param_and_grad()
 
     def build_dataloader(self):
+        disc_data_config_name = self.cfg.actor.model.openpi.get(
+            "disc_data_config_name",
+            self.cfg.actor.model.openpi.config_name,
+        )
         config = get_openpi_config(
-            self.cfg.actor.model.openpi.config_name + "_expert",
+            disc_data_config_name,
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.reward.micro_batch_size
         )
@@ -1223,35 +1227,31 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
 
-    def run_training(self):
+    @Worker.timer()
+    def run_training_actor_critic(self):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
-        if self.is_disc_optimizer_offloaded:
-            self.load_discriminator_optimizer(self.device)
 
         self.model.train()
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
-        discriminator_size = rollout_size * self.cfg.actor.model.num_action_chunks
-
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_ac_id = torch.randperm(rollout_size, generator=g)
-        shuffle_disc_id = torch.randperm(discriminator_size, generator=g)
         actor_critic_batch = {
             key: value
             for key, value in self.rollout_batch.items()
             if key != "chunk_observations"
         }
-        discriminator_batch = self.rollout_batch["chunk_observations"]
 
         with torch.no_grad():
-            actor_critic_batch = process_nested_dict_for_train(actor_critic_batch, shuffle_ac_id)
-            discriminator_batch = process_nested_dict_for_train(discriminator_batch, shuffle_disc_id)
+            actor_critic_batch = process_nested_dict_for_train(
+                actor_critic_batch, shuffle_ac_id
+            )
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1265,11 +1265,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
             // self._world_size
         )
 
-        self.disc_gradient_accumulation = (
-            self.cfg.reward.global_batch_size
-            // self.cfg.reward.micro_batch_size
-            // self._world_size
-        )
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         rollout_size = actor_critic_batch["prev_logprobs"].size(0)  ## rollout_size is the total batch from the rollout
@@ -1415,7 +1410,42 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
+        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = all_reduce_dict(
+            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        return mean_metric_dict
 
+    @Worker.timer()
+    def run_training_discriminator(self):
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_disc_optimizer_offloaded:
+            self.load_discriminator_optimizer(self.device)
+
+        self.model.train()
+        rollout_size = (
+            self.rollout_batch["prev_logprobs"].shape[0]
+            * self.rollout_batch["prev_logprobs"].shape[1]
+        )
+        discriminator_size = rollout_size * self.cfg.actor.model.num_action_chunks
+
+        g = torch.Generator()
+        g.manual_seed(self.cfg.actor.seed + self._rank)
+        shuffle_disc_id = torch.randperm(discriminator_size, generator=g)
+        discriminator_batch = self.rollout_batch["chunk_observations"]
+
+        with torch.no_grad():
+            discriminator_batch = process_nested_dict_for_train(
+                discriminator_batch, shuffle_disc_id
+            )
+
+        metrics = {}
+        self.disc_gradient_accumulation = (
+            self.cfg.reward.global_batch_size
+            // self.cfg.reward.micro_batch_size
+            // self._world_size
+        )
         ### training discriminator
         disc_rollout_size = discriminator_batch["normalized_actions"].size(0)  ## rollout_size is the total batch from the rollout
         disc_batch_size_per_rank = self.cfg.reward.global_batch_size // self._world_size
@@ -1452,9 +1482,6 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                     )
                     
                     observation, actions = next(self.data_iter)
-                    # from remote_pdb import RemotePdb
-                    # port = 14444 + (os.getpid() % 1000)
-                    # RemotePdb(os.getenv("RAY_ADDRESS").split(":")[0], port).set_trace()
                     observation = jax.tree.map(
                         lambda x: torch.as_tensor(x, device=f"cuda:{int(os.environ['LOCAL_RANK'])}")
                         .contiguous()
@@ -1462,9 +1489,10 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                         observation,
                     )
                     actions = actions.to(device=f"cuda:{int(os.environ['LOCAL_RANK'])}", dtype=torch.float32)
+    
                     expert_batch = {
                         "observation": observation,
-                        "normalized_actions": actions.squeeze(), ### needed for mlp 
+                        "normalized_actions": actions.squeeze(1), ### needed for mlp 
                     } 
                     assert policy_batch["normalized_actions"].shape[0] == expert_batch["normalized_actions"].shape[0], "batch size of policy and expert should be the same"
                     backward_ctx = self.before_micro_batch(
@@ -1473,25 +1501,25 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                     )
 
                     with self.amp_context:
-                        policy_disc_output = self.model(
+                        negative_disc_output = self.model(
                             data=policy_batch,
                             head_name="discriminator",
                             data_type="policy" 
                         )
-                        expert_disc_output = self.model(
+                        positive_disc_output = self.model(
                             data=expert_batch,
                             head_name="discriminator",
                             data_type="expert" 
                         )
-                    policy_target = torch.zeros_like(policy_disc_output)
-                    expert_target = torch.ones_like(expert_disc_output)
+                    negative_target = torch.zeros_like(negative_disc_output)
+                    positive_target = torch.ones_like(positive_disc_output)
                     kwargs = {
                         "loss_type": self.cfg.algorithm.irl_loss_type,
                         "task_type": self.cfg.runner.task_type,
-                        "policy_input": policy_disc_output,
-                        "policy_target": policy_target,
-                        "expert_input": expert_disc_output, 
-                        "expert_target": expert_target, 
+                        "negative_input": negative_disc_output,
+                        "negative_target": negative_target,
+                        "positive_input": positive_disc_output,
+                        "positive_target": positive_target,
                     }
                     disc_loss, disc_metrics_data = policy_loss(**kwargs)
 
@@ -1499,18 +1527,19 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
                         entropy_kwargs = {
                         "loss_type": self.cfg.algorithm.irl_loss_type + "_entropy",
                         "task_type": self.cfg.runner.task_type,
-                        "policy_input": policy_disc_output,
-                        "expert_input": expert_disc_output,  # dummy input
+                        "negative_input": negative_disc_output,
+                        "positive_input": positive_disc_output,
                         }
                         disc_entropy_loss, disc_entropy_metrics_data = policy_loss(**entropy_kwargs)
                         disc_metrics_data.update(disc_entropy_metrics_data)
                         disc_loss -= self.cfg.algorithm.irl_entropy_bonus * disc_entropy_loss
                     
+                    disc_total_loss = disc_loss.detach().item()
                     disc_loss /= self.disc_gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(disc_loss).backward()
 
-                    disc_metrics_data["discriminator/total_loss"] = disc_loss.detach().item()
+                    disc_metrics_data["discriminator/total_loss"] = disc_total_loss
                     append_to_dict(metrics, disc_metrics_data)
 
                 torch.cuda.empty_cache()
@@ -1525,13 +1554,23 @@ class IRLEmbodiedFSDPActor(EmbodiedFSDPActor):
         self.discriminator_lr_scheduler.step()
         self.discriminator_optimizer.zero_grad()
         clear_memory()
-        
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
-
         return mean_metric_dict
+
+    def run_training(self):
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+        if self.is_disc_optimizer_offloaded:
+            self.load_discriminator_optimizer(self.device)
+
+        metrics = self.run_training_actor_critic()
+        metrics.update(self.run_training_discriminator())
+        return metrics
                   
 
         #             entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())

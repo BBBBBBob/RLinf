@@ -559,16 +559,21 @@ def convert_trajectories_to_batch(
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
     
-    if trajectories[0].chunk_observations:
+    chunk_observations_list = [
+        traj.chunk_observations
+        for traj in trajectories
+        if hasattr(traj, "chunk_observations") and traj.chunk_observations
+    ]
+    if chunk_observations_list:
         all_keys: set[str] = set()
-        for traj in trajectories:
-            all_keys.update(traj.chunk_observations.keys())
+        for chunk_observations in chunk_observations_list:
+            all_keys.update(chunk_observations.keys())
         batch["chunk_observations"] = {}
         for key in all_keys:
             tensors = [
-                traj.chunk_observations[key]
-                for traj in trajectories
-                if key in traj.chunk_observations
+                chunk_observations[key]
+                for chunk_observations in chunk_observations_list
+                if key in chunk_observations
             ]
             if tensors:
                 batch["chunk_observations"][key] = torch.cat(tensors, dim=1)

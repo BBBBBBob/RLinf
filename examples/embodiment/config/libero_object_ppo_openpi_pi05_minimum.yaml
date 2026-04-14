@@ -1,7 +1,7 @@
 defaults:
-  - env/libero_object_irl@env.train
-  - env/libero_object_irl@env.eval
-  - model/pi0_5_irl@actor.model
+  - env/libero_object@env.train
+  - env/libero_object@env.eval
+  - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
@@ -15,18 +15,17 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout,reward: all
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "pi05_libero_object_rl_irl"
+    experiment_name: "test_openpi"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
-  update_disc_epochs: 10 # every 10 epoch update once disc
   max_steps: -1
 
   only_eval: False
@@ -36,11 +35,7 @@ runner:
   seq_length: 4096
   max_prompt_length: 50
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: /mnt/jfs-01/team-agent/home/j84403411/IRL/model/libero_object_sft_mlp/actor/model_state_dict/full_weights.pt
-
-data:
-  data_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/data/"
+  resume_dir: null
 
 algorithm:
   normalize_advantages: True
@@ -89,17 +84,13 @@ algorithm:
     max_length: 1024
     min_length: 1
 
-  irl_update_epoch: 5
-  irl_loss_type: gail
-  irl_entropy_bonus: 0.1
-  
 env:
   group_name: "EnvGroup"
   enable_offload: False
 
   # Override the default values in env/libero_object
   train:
-    total_num_envs: 8
+    total_num_envs: 16
     max_episode_steps: 240 # max episode steps for truncation
     max_steps_per_rollout_epoch: 240
   eval:
@@ -119,12 +110,12 @@ rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   recompute_logprobs: False
-  unnorm_key: libero_object
+  unnorm_key: libero_10
   enable_offload: True
   pipeline_stage_num: 1
 
   model:
-    model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/base_model_pytorch"
+    model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     precision: ${actor.model.precision}
 
 actor:
@@ -137,28 +128,22 @@ actor:
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/base_model_pytorch"
+    model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
     num_action_chunks: 5 # interface for the env
     num_steps: 5
     add_value_head: True
     # openpi specific parameters
     openpi:
-      disc_data_config_name: "pi05_libero_object_rl_irl_positive"
       noise_level: 0.3
       value_after_vlm: True
 
   optim:
     lr: 1.0e-6
     value_lr: 1.0e-4
-    disc_lr: 1.0e-5
     adam_beta1: 0.9
     adam_beta2: 0.95
-    disc_adam_beta1: 0.9
-    disc_adam_beta2: 0.95
-    adam_eps: 1.0e-05
-    disc_adam_eps: 1.0e-05
+    adam_eps: 1.0e-08
     weight_decay: 0.01
-    disc_weight_decay: 0.01
     clip_grad: 1.0
     critic_warmup_steps: 0
 
@@ -175,15 +160,7 @@ actor:
   use_reward_model: ${reward.use_reward_model}
   
 reward:
-  use_reward_model: True
-  group_name: "RewardGroup"
-  micro_batch_size: 60
-  global_batch_size: 480
-  enable_offload: True
-  
-  model:
-    model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/base_model_pytorch"
-    precision: ${actor.model.precision}
+  use_reward_model: False
 
 critic:
   use_critic_model: False

@@ -30,7 +30,7 @@ class IRLRewardWorker(Worker):
         self.actor_group_name = cfg.actor.group_name
         self.device = torch.cuda.current_device()
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
-        self.enable_offload = self.cfg.rollout.get("enable_offload", False)
+        self.enable_offload = self.cfg.reward.get("enable_offload", False)
 
         self.placement = HybridComponentPlacement(cfg, Cluster())
 

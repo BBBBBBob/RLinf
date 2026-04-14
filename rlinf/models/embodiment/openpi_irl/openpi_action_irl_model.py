@@ -333,9 +333,9 @@ class OpenPi0ForRLActionRewardPredictionGemma(OpenPi0ForRLActionPrediction):
     ):
         super().__init__(config)
         expert_config = copy.deepcopy(self.paligemma_with_expert.gemma_expert.config)
-        self.discriminator = GemmaForCausalLM(config=expert_config)
-        self.discriminator.model.embed_tokens = None
-        self.discriminator = self.discriminator.to(dtype=self.action_out_proj.weight.dtype)
+        self.discriminator_head = GemmaForCausalLM(config=expert_config)
+        self.discriminator_head.model.embed_tokens = None
+        self.discriminator_head = self.discriminator_head.to(dtype=self.action_out_proj.weight.dtype)
         width = expert_config.hidden_size
         # Dedicated projection/MLP stack for discriminator path
         self.disc_action_in_proj = torch.nn.Linear(32, width, dtype=self.action_out_proj.weight.dtype)
@@ -617,9 +617,9 @@ class OpenPi0ForRLActionRewardPredictionGemma(OpenPi0ForRLActionPrediction):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.discriminator.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.discriminator_head.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        disc_output = self.discriminator.model.forward(
+        disc_output = self.discriminator_head.model.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,

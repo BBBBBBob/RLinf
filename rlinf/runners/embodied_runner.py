@@ -440,9 +440,15 @@ class IRLEmbodiedRunner:
                         self.actor.compute_advantages_and_returns().wait()
                     )
 
+                discriminator_training_handle = None
+                discriminator_training_metrics = None
+                if _step % self.cfg.runner.update_disc_epochs == 0:
+                    discriminator_training_handle: Handle = self.actor.run_training_discriminator()
+                    discriminator_training_metrics = discriminator_training_handle.wait()
+
                 # actor training.
-                actor_training_handle: Handle = self.actor.run_training()
-                actor_training_metrics = actor_training_handle.wait()
+                actor_critic_training_handle: Handle = self.actor.run_training_actor_critic()
+                actor_critic_training_metrics = actor_critic_training_handle.wait()
                 
                 self.global_step += 1
 
@@ -483,11 +489,12 @@ class IRLEmbodiedRunner:
                     for k, v in rollout_handle.consume_durations().items()
                 }
             )
-            time_metrics.update(
-                {
-                    f"time/actor/{k}": v
-                    for k, v in actor_training_handle.consume_durations().items()
-                }
+            if discriminator_training_handle is not None:
+                time_metrics["time/discriminator/training"] = (
+                    discriminator_training_handle.consume_duration()
+                )
+            time_metrics["time/actor_critic/training"] = (
+                actor_critic_training_handle.consume_duration()
             )
 
             env_results_list = [
@@ -500,20 +507,29 @@ class IRLEmbodiedRunner:
                 f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
             }
 
-            training_metrics = {
-                f"train/{k}": v for k, v in actor_training_metrics[0].items()
+            actor_critic_metrics = {
+                f"train/{k}": v for k, v in actor_critic_training_metrics[0].items()
             }
+            discriminator_metrics = {}
+            if discriminator_training_metrics is not None:
+                discriminator_metrics = {
+                    f"train/{k}": v
+                    for k, v in discriminator_training_metrics[0].items()
+                }
      
             self.metric_logger.log(env_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
-            self.metric_logger.log(training_metrics, _step)
+            self.metric_logger.log(actor_critic_metrics, _step)
+            if discriminator_metrics:
+                self.metric_logger.log(discriminator_metrics, _step)
 
-            logging_metrics = time_metrics
+            logging_metrics = dict(time_metrics)
             logging_metrics.update(eval_metrics)
             logging_metrics.update(env_metrics)
             logging_metrics.update(rollout_metrics)
-            logging_metrics.update(training_metrics)
+            logging_metrics.update(actor_critic_metrics)
+            logging_metrics.update(discriminator_metrics)
 
             self.print_metrics_table_async(
                 _step, self.max_steps, start_time, logging_metrics, start_step

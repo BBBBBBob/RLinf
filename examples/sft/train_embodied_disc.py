@@ -14,18 +14,16 @@
 
 import json
 import os
+
 import hydra
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
-from rlinf.runners.embodied_runner import IRLEmbodiedRunner
+from rlinf.runners.discriminator_runner import DiscriminatorRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.actor.fsdp_actor_worker import IRLEmbodiedFSDPActor
-from rlinf.workers.env.env_worker import IRLEnvWorker
-from rlinf.workers.rollout.hf.huggingface_worker import IRLMultiStepRolloutWorker
-from rlinf.workers.reward.irl_reward_worker import IRLRewardWorker
+from rlinf.workers.sft.fsdp_disc_worker import FSDPDiscWorker
 
 mp.set_start_method("spawn", force=True)
 
@@ -35,39 +33,21 @@ mp.set_start_method("spawn", force=True)
 )
 def main(cfg) -> None:
     os.environ["HF_LEROBOT_HOME"] = cfg.data.data_path
+    
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = HybridComponentPlacement(cfg, cluster)
 
-    # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
-    actor_group = IRLEmbodiedFSDPActor.create_group(cfg).launch(
+    actor_group = FSDPDiscWorker.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
-    # Create rollout worker group
-    rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = IRLMultiStepRolloutWorker.create_group(cfg).launch(
-        cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
-    )
-    # Create reward worker group
-    reward_placement = component_placement.get_strategy("reward")
-    reward_group = IRLRewardWorker.create_group(cfg).launch(
-        cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
-    )
-    # Create env worker group
-    env_placement = component_placement.get_strategy("env")
-    env_group = IRLEnvWorker.create_group(cfg).launch(
-        cluster, name=cfg.env.group_name, placement_strategy=env_placement
-    )
 
-    runner = IRLEmbodiedRunner(
+    runner = DiscriminatorRunner(
         cfg=cfg,
         actor=actor_group,
-        rollout=rollout_group,
-        env=env_group,
-        reward=reward_group
     )
 
     runner.init_workers()

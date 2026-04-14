@@ -14,15 +14,18 @@
 
 import copy
 import os
+import pickle
 from typing import Optional, Union
 
 import gym
-import numpy as np
 import torch
+import numpy as np
+
 from libero.libero import get_libero_path
 from libero.libero.benchmark import Benchmark
 from libero.libero.envs import OffScreenRenderEnv
 from omegaconf.omegaconf import OmegaConf
+
 
 from rlinf.envs.libero.utils import (
     get_benchmark_overridden,
@@ -497,6 +500,92 @@ class LiberoEnv(gym.Env):
 class IRLLiberoEnv(LiberoEnv):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
+        from libero.libero.envs.bddl_base_domain import OBJECT_PLACEMENTS_DIR
+
+    def _compute_total_num_group_envs(self):
+        # In IRL mode we train from task-level object placements rather than
+        # benchmark trial init states, so sampling should be task-uniform.
+        self.total_num_group_envs = self.task_suite.get_num_tasks()
+        self.trial_id_bins = [1] * self.total_num_group_envs
+        self.cumsum_trial_id_bins = np.arange(1, self.total_num_group_envs + 1)
+
+    def _get_task_and_trial_ids_from_reset_state_ids(self, reset_state_ids):
+        task_ids = np.asarray(reset_state_ids, dtype=int)
+        trial_ids = np.zeros_like(task_ids)
+        return task_ids, trial_ids
+
+    def _get_ordered_reset_state_ids(self, num_reset_states):
+        if self.specific_reset_id is not None:
+            return self.specific_reset_id * np.ones(
+                (num_reset_states,), dtype=int
+            )
+
+        if not hasattr(self, "_ordered_task_ids"):
+            self._ordered_task_ids = np.arange(self.total_num_group_envs, dtype=int)
+            self._generator_ordered.shuffle(self._ordered_task_ids)
+
+        # Consume a shared global round-robin task schedule across all processes.
+        # This keeps task counts within 1 of each other for any prefix of draws.
+        global_start = (
+            self.start_idx * self.total_num_processes
+            + self.seed_offset * num_reset_states
+        )
+        positions = np.arange(global_start, global_start + num_reset_states)
+        reset_state_ids = self._ordered_task_ids[
+            positions % self.total_num_group_envs
+        ]
+        self.start_idx += num_reset_states
+        return reset_state_ids
+
+    def get_env_fn_params(self, env_idx=None):
+        env_fn_params = []
+        base_env_args = OmegaConf.to_container(self.cfg.init_params, resolve=True)
+
+        task_descriptions = []
+        if env_idx is None:
+            env_idx = np.arange(self.num_envs)
+        for env_id in range(self.num_envs):
+            if env_id not in env_idx:
+                task_descriptions.append(self.task_descriptions[env_id])
+                continue
+            task = self.task_suite.get_task(self.task_ids[env_id])
+            task_bddl_file = os.path.join(
+                get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+            )
+            
+            placement_path = os.path.join(
+                OBJECT_PLACEMENTS_DIR, self.cfg.task_suite_name, f"{task.name}.pkl"
+            )
+            with open(placement_path, "rb") as f:
+                object_placement = pickle.load(f)
+            env_fn_params.append(
+                {
+                    **base_env_args,
+                    "bddl_file_name": task_bddl_file,
+                    "seed": self.seed,
+                    "init_object_placements": object_placement,
+                }
+            )
+            task_descriptions.append(task.language)
+        self.task_descriptions = task_descriptions
+        return env_fn_params
+    
+
+    def _reconfigure(self, reset_state_ids, env_idx):
+        reconfig_env_idx = []
+        task_ids, trial_ids = self._get_task_and_trial_ids_from_reset_state_ids(
+            reset_state_ids
+        )
+        for j, env_id in enumerate(env_idx):
+            if self.task_ids[env_id] != task_ids[j]:
+                reconfig_env_idx.append(env_id)
+            self.task_ids[env_id] = task_ids[j]
+            self.trial_ids[env_id] = trial_ids[j]
+        if reconfig_env_idx:
+            env_fn_params = self.get_env_fn_params(reconfig_env_idx)
+            self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
+        self.env.seed(self.seed * len(env_idx))
+        self.env.reset(id=env_idx)
 
     def chunk_step(self, chunk_actions, last_extracted_obs):
         # chunk_actions: [num_envs, chunk_step, action_dim]

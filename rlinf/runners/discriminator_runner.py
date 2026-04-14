@@ -49,6 +49,7 @@ class DiscriminatorRunner:
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
 
         self.metric_logger = MetricLogger(cfg)
+        
 
     def init_workers(self) -> None:
         # create worker in order to decrease the maximum memory usage
