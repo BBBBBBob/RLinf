@@ -121,7 +121,7 @@ rollout:
   recompute_logprobs: False
   unnorm_key: libero_object
   enable_offload: True
-  pipeline_stage_num: 1
+  pipeline_stage_num: 2
 
   model:
     model_path: "/mnt/jfs-01/team-agent/home/j84403411/IRL/model/base_model_pytorch"
